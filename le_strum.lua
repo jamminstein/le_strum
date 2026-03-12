@@ -1266,6 +1266,7 @@ end
 
 function cleanup()
   panic()
+  clock.cancel_all()
 end
 
 function enc(n, d)
