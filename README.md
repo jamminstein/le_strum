@@ -1,40 +1,28 @@
 # le_strum
 
-A Le Grand Strum-inspired strummed chord controller for norns + grid. Features scale mode, organ buttons, guitar bass, chord hold, retrigger on chord change, and clock-synced arpeggiator.
-
-## Install
-
-`;install https://github.com/jamminstein/le_strum`
+> Strummed chord controller with grid and arpeggiator
 
 ## Controls
 
-**Norns:**
-- K1+K2: Shift (access secondary functions)
-- K3: Panic (reset all notes)
-- E2: Transpose (± octaves)
-- E3: Octave adjust
+- **E2** — transpose
+- **E3** — octave
+- **K2** — toggle shift layer
+- **K3** — panic / all notes off
+- **K1 (hold)** — shift: access MIDI ports, octave, velocity, pluck mode, ratchet, curves, transpose, drone
 
-**Grid (16x8):**
-- Left columns: Chord matrix for scale mode
-- Middle columns: String strumming
-- Right area: Settings and organ buttons
-- K2 (held): Shift layer for additional settings
+## Grid
 
-## Features
-
-- MIDI output only (no internal engine)
-- Grid-based chord selection with scale mode
-- Guitar bass and chord hold modes
-- Retrigger on chord change
-- Clock-synced arpeggiator
-- Comprehensive shift layer for deep control
+Chord matrix (1–12 × 1–3), string row (row 8, 1–16). Shift layer: MIDI routing, octave, velocity, pluck timing, ratchet, velocity curves, direction accent, mode flags, transpose, drone. Presets in row 2 (shift layer) for classic strum, guitar+bass, organ pad, and scale arp.
 
 ## Requirements
 
 - norns
-- 16x8 grid
-- MIDI output device (or use norns' MIDI out)
+- grid (16×8, required)
+- MIDI devices (port A + optional port B)
+- engine: None (MIDI only)
 
-## Author
+## Install
 
-@jamminstein
+```
+;install https://github.com/jamminstein/le_strum
+```
