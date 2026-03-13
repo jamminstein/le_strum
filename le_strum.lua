@@ -1,7 +1,11 @@
--- le_strum.lua
+-- le_strum.lua ENHANCED
 -- Le Grand Strum-inspired strummed chord controller for norns + grid (v6)
 -- Features: scale mode, organ buttons, guitar bass, chord hold,
 --           retrigger on chord change, clock-synced arpeggiator
+--
+-- NEW FEATURES:
+-- - Velocity-sensitive strum: measure time between column presses, map to velocity
+-- - Fingerpick patterns: named patterns (travis, arpeggio, waltz, folk)
 
 -- midi and grid are norns globals, no require needed
 
@@ -12,7 +16,7 @@ local function clamp(x, lo, hi)
   if x < lo then return lo end
   if x > hi then return hi end
   return x
-end
+nend
 
 local function pc(n) return (n % 12 + 12) % 12 end
 
@@ -101,6 +105,10 @@ local dir_window = 0.20
 local vel_curve = "flat" -- flat/ramp_up/ramp_down/bell
 local dir_accent = 12    -- accent magnitude
 
+-- NEW: velocity-sensitive strum
+local strum_velocity_time = -1  -- timestamp of last strum
+local strum_velocity_base = 100
+
 -- ratcheting
 local ratchet_count = 1
 local ratchet_div = 1/16
@@ -117,9 +125,7 @@ local drone_latched_notes = {}
 local drone_ch = 2
 local drone_vel = 80
 
--- === NEW: scale mode ===
--- "chord" = map strings to chord tones (original behavior)
--- "chromatic" / "diatonic" / "pentatonic" = map to scale
+-- scale mode
 local string_mode = "chord"
 local scale_intervals = {
   chromatic   = {0,1,2,3,4,5,6,7,8,9,10,11},
@@ -127,21 +133,19 @@ local scale_intervals = {
   pentatonic  = {0,2,4,7,9},
 }
 
--- === NEW: organ buttons ===
+-- organ buttons
 local organ_enabled = false
 local organ_ch = 2
 local organ_active_notes = {}
 
--- === NEW: guitar bass note ===
+-- guitar bass note
 local guitar_bass = false
 
--- === NEW: chord hold ===
--- true = chord persists after button release (default, original behavior)
--- false = releasing chord button damps all strings + organ
+-- chord hold
 local chord_hold = true
 local chord_held_count = 0
 
--- === NEW: arpeggiator (circular strum simulation) ===
+-- arpeggiator
 local arp_enabled = false
 local arp_div_idx = 2
 local arp_divs = {1/4, 1/8, 1/16, 1/32}
@@ -149,6 +153,18 @@ local arp_div_labels = {"1/4", "1/8", "1/16", "1/32"}
 local arp_gen = 0
 local arp_step = 1
 local arp_current_note = nil
+
+-- NEW: fingerpick patterns
+local PICK_PATTERNS = {
+  travis = {1,5,3,5,2,5,3,5},
+  arpeggio = {1,2,3,4,5,6},
+  waltz = {1,3,2,3},
+  folk = {1,5,2,5,3,5},
+}
+local PICK_NAMES = {"travis", "arpeggio", "waltz", "folk"}
+local pick_pattern_idx = 1
+local pick_pattern = PICK_PATTERNS.travis
+local pick_mode = false  -- when true, auto-play pattern
 
 -- strings runtime
 local held_string, latched_string, active_note_for_string = {}, {}, {}
@@ -307,7 +323,6 @@ local function build_string_notes_guitar()
   local out = {}
   local offset = 0
 
-  -- NEW: guitar bass — string 1 is root below the voicing
   if guitar_bass then
     local root_note = (octave * 12) + root_pc + transpose
     out[1] = root_note - 12
@@ -322,7 +337,6 @@ local function build_string_notes_guitar()
   return out
 end
 
--- NEW: scale mode voicing
 local function build_string_notes_scale(intervals)
   local root_note = (octave * 12) + root_pc + transpose
   local num = #intervals
@@ -354,6 +368,71 @@ local function build_string_notes()
 end
 
 ------------------------------------------------------------
+-- NEW: VELOCITY-SENSITIVE STRUM
+-- Measure time between consecutive string presses
+-- Faster = higher velocity; <50ms = 127, >200ms = 60
+------------------------------------------------------------
+
+local function calc_strum_velocity(current_time)
+  if strum_velocity_time < 0 then
+    strum_velocity_time = current_time
+    return 100
+  end
+  
+  local time_delta = (current_time - strum_velocity_time) * 1000  -- convert to ms
+  
+  -- Velocity mapping: <50ms -> 127, >200ms -> 60, linear between
+  local vel
+  if time_delta < 50 then
+    vel = 127
+  elseif time_delta > 200 then
+    vel = 60
+  else
+    -- Linear interpolation
+    vel = 127 - ((time_delta - 50) / 150) * 67
+  end
+  
+  strum_velocity_time = current_time
+  return clamp_vel(vel)
+end
+
+------------------------------------------------------------
+-- NEW: FINGERPICK PATTERN AUTO-PLAY
+------------------------------------------------------------
+
+local fingerpick_clk = nil
+
+local function fingerpick_stop()
+  if fingerpick_clk then
+    pcall(function() clock.cancel(fingerpick_clk) end)
+    fingerpick_clk = nil
+  end
+end
+
+local function fingerpick_start()
+  fingerpick_stop()
+  
+  fingerpick_clk = clock.run(function()
+    while pick_mode do
+      local root_note = (octave * 12) + root_pc + transpose
+      local tones = build_chord_tones(root_note)
+      
+      if #pick_pattern > 0 and #tones > 0 then
+        for _, idx in ipairs(pick_pattern) do
+          if idx <= #tones then
+            local note = tones[idx]
+            midi_note_on(note, velocity, midi_ch)
+            clock.sleep(0.05)
+            midi_note_off(note, midi_ch)
+            clock.sleep(clock.get_beat_sec() * (60 / 120))  -- simple timing
+          end
+        end
+      end
+    end
+  end)
+end
+
+------------------------------------------------------------
 -- direction & velocity shaping
 ------------------------------------------------------------
 local function infer_direction(i)
@@ -368,8 +447,8 @@ local function infer_direction(i)
   return (d ~= 0) and d or last_dir
 end
 
-local function vel_for_string(i, inferred_dir)
-  local base = velocity
+local function vel_for_string(i, inferred_dir, strum_vel)
+  local base = strum_vel or velocity
   local t = (i-1) / (STRINGS-1)
 
   local curve = 0
@@ -506,7 +585,7 @@ local function drone_on_chord_change(new_pcs)
 end
 
 ------------------------------------------------------------
--- NEW: organ buttons
+-- organ buttons
 ------------------------------------------------------------
 local function organ_notes_off()
   for _, n in ipairs(organ_active_notes) do
@@ -527,16 +606,14 @@ local function organ_notes_on()
 end
 
 ------------------------------------------------------------
--- NEW: arpeggiator (circular strum simulation)
+-- arpeggiator
 ------------------------------------------------------------
 local function arp_stop()
   arp_gen = arp_gen + 1
   arp_enabled = false
-  -- coroutine will clean up via generation check
 end
 
 local function arp_start()
-  -- kill any lingering note from previous generation
   if arp_current_note then
     midi_note_off(arp_current_note, midi_ch)
     arp_current_note = nil
@@ -554,7 +631,6 @@ local function arp_start()
         if arp_step > #tones then arp_step = 1 end
         local note = tones[arp_step]
 
-        -- turn off previous arp note
         if arp_current_note then
           midi_note_off(arp_current_note, midi_ch)
         end
@@ -567,9 +643,6 @@ local function arp_start()
       clock.sync(arp_divs[arp_div_idx])
     end
 
-    -- cleanup when coroutine exits
-    -- only clean up if we're still the active generation
-    -- (if a new gen started, it owns arp_current_note now)
     if my_gen == arp_gen and arp_current_note then
       midi_note_off(arp_current_note, midi_ch)
       arp_current_note = nil
@@ -608,7 +681,7 @@ local function apply_chord_change(old_pcs)
         else
           midi_note_off(old, midi_ch)
           local d = infer_direction(i)
-          local vel = vel_for_string(i, d)
+          local vel = vel_for_string(i, d, velocity)
           midi_note_on(newn, vel, midi_ch)
           active_note_for_string[i] = newn
           if behavior.retrigger_on_chord_change then
@@ -622,7 +695,6 @@ local function apply_chord_change(old_pcs)
 
   drone_on_chord_change(new_pcs)
 
-  -- organ buttons: retrigger on chord change (if any chord cell is held)
   if organ_enabled and chord_held_count > 0 then
     organ_notes_on()
   end
@@ -641,6 +713,7 @@ local function panic()
     midi_note_off(arp_current_note, midi_ch)
     arp_current_note = nil
   end
+  fingerpick_stop()
   grid_dirty = true
 end
 
@@ -656,15 +729,12 @@ local function chord_from_cell(x,y)
   root_pc = (x-1) % 12
   quality = pages[chord_page][y]
   apply_chord_change(old_pcs)
-  -- organ: fire chord on ch2 when button is pressed
   organ_notes_on()
   grid_dirty = true
 end
 
 local function chord_release()
-  -- organ always stops on chord button release
   organ_notes_off()
-  -- if chord_hold is off, damp all strings too
   if not chord_hold then
     all_notes_off_strings()
   end
@@ -685,7 +755,10 @@ local function handle_string(i, z)
   local notes = build_string_notes()
   local note = notes[i]
   local d = infer_direction(i)
-  local vel = vel_for_string(i, d)
+  
+  -- NEW: calculate velocity based on strum speed
+  local strum_vel = calc_strum_velocity(util.time())
+  local vel = vel_for_string(i, d, strum_vel)
 
   local is_make = (z==1)
   local is_break = (z==0)
@@ -726,13 +799,12 @@ local function handle_string(i, z)
 end
 
 ------------------------------------------------------------
--- patches (updated with new features)
+-- patches
 ------------------------------------------------------------
 local patch = 1
 local function load_patch(p)
   patch = clamp(p,1,4)
   if patch == 1 then
-    -- Classic strum
     mode = "momentary"; apply_mode()
     voicing = "close"
     string_mode = "chord"
@@ -742,10 +814,10 @@ local function load_patch(p)
     organ_enabled = false
     guitar_bass = false
     chord_hold = true
+    pick_mode = false
     behavior.retrigger_on_chord_change = false
     if arp_enabled then arp_stop() end
   elseif patch == 2 then
-    -- Guitar strum with bass
     mode = "momentary"; apply_mode()
     voicing = "guitar"
     string_mode = "chord"
@@ -755,10 +827,10 @@ local function load_patch(p)
     organ_enabled = false; organ_notes_off()
     guitar_bass = true
     chord_hold = true
+    pick_mode = false
     behavior.retrigger_on_chord_change = false
     if arp_enabled then arp_stop() end
   elseif patch == 3 then
-    -- Organ pad
     mode = "momentary"; apply_mode()
     voicing = "spread"
     string_mode = "chord"
@@ -768,10 +840,10 @@ local function load_patch(p)
     organ_enabled = true
     guitar_bass = false
     chord_hold = false
+    pick_mode = false
     behavior.retrigger_on_chord_change = true
     if arp_enabled then arp_stop() end
   elseif patch == 4 then
-    -- Scale arp
     mode = "latch"; apply_mode()
     voicing = "close"
     string_mode = "pentatonic"
@@ -781,6 +853,7 @@ local function load_patch(p)
     organ_enabled = false
     guitar_bass = false
     chord_hold = true
+    pick_mode = false
     behavior.retrigger_on_chord_change = false
     arp_div_idx = 2
     if not arp_enabled then arp_start() end
@@ -824,30 +897,25 @@ local function normal_press(x,y)
     return
   end
 
-  -- row 5: NEW FEATURES
+  -- row 5: string modes, bass, organ, etc.
   if y==5 then
-    -- x1-4: string mode
     if x==1 then string_mode="chord"
     elseif x==2 then string_mode="chromatic"
     elseif x==3 then string_mode="diatonic"
     elseif x==4 then string_mode="pentatonic"
-    -- x6: guitar bass
     elseif x==6 then guitar_bass = not guitar_bass
-    -- x7: organ buttons
     elseif x==7 then
       organ_enabled = not organ_enabled
       if not organ_enabled then organ_notes_off() end
-    -- x8: retrigger on chord change
     elseif x==8 then
       behavior.retrigger_on_chord_change = not behavior.retrigger_on_chord_change
-    -- x9: chord hold
     elseif x==9 then chord_hold = not chord_hold
-    -- x11: arp toggle
+    elseif x==10 then  -- NEW: fingerpick mode toggle
+      pick_mode = not pick_mode
+      if pick_mode then fingerpick_start() else fingerpick_stop() end
     elseif x==11 then arp_toggle()
-    -- x13-16: arp division
     elseif x>=13 and x<=16 then
       arp_div_idx = x - 12
-      -- if arp is running, restart to pick up new division immediately
       if arp_enabled then arp_start() end
     end
     apply_chord_change(old_pcs)
@@ -992,6 +1060,16 @@ local function shift_press(x,y)
     return
   end
 
+  -- NEW: Fingerpick pattern select (y6 x5..8)
+  if y==6 and x>=5 and x<=8 then
+    pick_pattern_idx = x - 4
+    if pick_pattern_idx <= #PICK_NAMES then
+      pick_pattern = PICK_PATTERNS[PICK_NAMES[pick_pattern_idx]]
+    end
+    grid_dirty = true
+    return
+  end
+
   -- Drone: y8 x14 common-only, x15 toggle
   if y==8 and x==14 then
     drone_common_only = not drone_common_only
@@ -1084,6 +1162,12 @@ local function grid_redraw()
     local vals = {0,8,16,24}
     for x=13,16 do g:led(x,5, (dir_accent==vals[x-12]) and 12 or 2) end
 
+    -- NEW: Fingerpick patterns (y6 x5..8)
+    for x=5,8 do
+      local idx = x - 4
+      g:led(x,6, (pick_pattern_idx==idx) and 15 or 3)
+    end
+
     -- Mode
     g:led(9,6,  mode=="momentary" and 15 or 3)
     g:led(10,6, mode=="break" and 15 or 3)
@@ -1120,23 +1204,17 @@ local function grid_redraw()
     g:led(15,4, voicing=="guitar" and 15 or 3)
     g:led(16,4, voicing=="spread" and 15 or 3)
 
-    -- Row 5: NEW FEATURES
-    -- x1-4: string mode
+    -- Row 5: string mode, bass, organ, retrigger, chord_hold, fingerpick, arp
     g:led(1,5, string_mode=="chord" and 12 or 2)
     g:led(2,5, string_mode=="chromatic" and 12 or 2)
     g:led(3,5, string_mode=="diatonic" and 12 or 2)
     g:led(4,5, string_mode=="pentatonic" and 12 or 2)
-    -- x6: guitar bass
     g:led(6,5, guitar_bass and 15 or 3)
-    -- x7: organ
     g:led(7,5, organ_enabled and 15 or 3)
-    -- x8: retrigger
     g:led(8,5, behavior.retrigger_on_chord_change and 15 or 3)
-    -- x9: chord hold
     g:led(9,5, chord_hold and 15 or 3)
-    -- x11: arp
+    g:led(10,5, pick_mode and 15 or 3)  -- NEW
     g:led(11,5, arp_enabled and 15 or 3)
-    -- x13-16: arp division
     for x=13,16 do
       g:led(x,5, (arp_div_idx==(x-12)) and 12 or 2)
     end
@@ -1160,18 +1238,18 @@ local function screen_redraw()
   screen.level(15)
 
   screen.move(10,12)
-  screen.text("le_strum v6 "..(shift and "[SET]" or "[PLAY]"))
+  screen.text("le_strum v6 ENHANCED "..(shift and "[SET]" or "[PLAY]"))
 
   screen.move(10,24)
-  screen.text(note_name(root_pc).." "..quality.." +"..add_mode.." pg:"..chord_page.." p:"..patch)
+  screen.text(note_name(root_pc)..\" \"..quality..\" +\"..add_mode..\" pg:\"..chord_page..\" p:\"..patch)
 
   screen.move(10,36)
   local voi_str = voicing
   if string_mode ~= "chord" then voi_str = string_mode end
-  screen.text("Voi:"..voi_str.." mode:"..mode.." vel:"..vel_curve)
+  screen.text("Voi:\"..voi_str..\" mode:\"..mode..\" vel:\"..vel_curve)
 
   screen.move(10,48)
-  screen.text("Oct:"..octave.." Tr:"..transpose.." Ch:"..midi_ch.." Rat:"..ratchet_count)
+  screen.text("Oct:\"..octave..\" Tr:\"..transpose..\" Ch:\"..midi_ch..\" Rat:\"..ratchet_count)
 
   screen.move(10,60)
   local flags = {}
@@ -1179,9 +1257,10 @@ local function screen_redraw()
   if guitar_bass then flags[#flags+1] = "Bass" end
   if not chord_hold then flags[#flags+1] = "Rel" end
   if behavior.retrigger_on_chord_change then flags[#flags+1] = "Rtg" end
-  if arp_enabled then flags[#flags+1] = "Arp:"..arp_div_labels[arp_div_idx] end
+  if pick_mode then flags[#flags+1] = "Pick:\"..PICK_NAMES[pick_pattern_idx] end
+  if arp_enabled then flags[#flags+1] = "Arp:\"..arp_div_labels[arp_div_idx] end
   if drone_enabled then flags[#flags+1] = "Drn" end
-  local flag_str = #flags > 0 and table.concat(flags, " ") or "---"
+  local flag_str = #flags > 0 and table.concat(flags, " \") or \"---\"
   screen.text(flag_str)
 
   screen.update()
