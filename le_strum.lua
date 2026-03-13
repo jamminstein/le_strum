@@ -6,6 +6,7 @@
 -- NEW FEATURES:
 -- - Velocity-sensitive strum: measure time between column presses, map to velocity
 -- - Fingerpick patterns: named patterns (travis, arpeggio, waltz, folk)
+-- - NEW SCREEN DESIGN: Status strip, live zone with string decay animation, context bar, parameter popup
 
 -- midi and grid are norns globals, no require needed
 
@@ -172,6 +173,20 @@ for i=1,STRINGS do
   held_string[i] = false
   latched_string[i] = false
   active_note_for_string[i] = nil
+end
+
+------------------------------------------------------------
+-- NEW SCREEN STATE: decay animation, popup, beat phase
+------------------------------------------------------------
+local beat_phase = 0  -- for beat pulse dot animation
+local popup_param = nil  -- parameter name for popup display
+local popup_val = nil  -- parameter value
+local popup_time = 0  -- time popup appeared
+local popup_duration = 0.8
+
+local string_activity = {}  -- {[i] = {time_on, time_off, vel}} for decay
+for i=1,STRINGS do
+  string_activity[i] = {time_on=0, time_off=0, vel=0}
 end
 
 ------------------------------------------------------------
@@ -481,6 +496,7 @@ local function turn_off_string(i)
   if n ~= nil then
     midi_note_off(n, midi_ch)
     active_note_for_string[i] = nil
+    string_activity[i].time_off = util.time()
   end
 end
 
@@ -489,6 +505,8 @@ local function turn_on_string(i, note, vel)
     midi_note_off(active_note_for_string[i], midi_ch)
   end
   active_note_for_string[i] = note
+  string_activity[i].time_on = util.time()
+  string_activity[i].vel = vel
   midi_note_on(note, vel, midi_ch)
 end
 
@@ -526,6 +544,7 @@ local function schedule_pluck_off(i, note)
     if active_note_for_string[i] == note then
       midi_note_off(note, midi_ch)
       active_note_for_string[i] = nil
+      string_activity[i].time_off = util.time()
       grid_dirty = true
     end
   end)
@@ -1084,6 +1103,145 @@ local function shift_press(x,y)
 end
 
 ------------------------------------------------------------
+-- NEW SCREEN DESIGN SYSTEM
+------------------------------------------------------------
+local function get_chord_name()
+  local name = note_name(root_pc) .. quality
+  if add_mode ~= "none" then name = name .. " +" .. add_mode end
+  return name
+end
+
+local function get_decay_brightness(i)
+  -- Calculate brightness based on time since note off
+  local activity = string_activity[i]
+  if active_note_for_string[i] ~= nil then
+    -- Currently playing: bright
+    return 10
+  end
+  
+  -- Fading out after note off
+  local time_since_off = util.time() - activity.time_off
+  if time_since_off < 0.3 then
+    -- Decay over 300ms
+    local progress = time_since_off / 0.3
+    return math.floor(10 * (1 - progress))
+  end
+  
+  return 0
+end
+
+local function screen_redraw()
+  screen.clear()
+  screen.aa(1)
+  
+  -- ============================================================
+  -- 1. STATUS STRIP (y 0-8)
+  -- ============================================================
+  screen.level(4)
+  screen.move(0, 6)
+  screen.text("LE STRUM")
+  
+  -- Current mode display at center
+  local mode_str = string.upper(string_mode)
+  if string_mode == "chord" then mode_str = quality end
+  screen.level(8)
+  screen.move(64, 6)
+  screen.text_center(mode_str)
+  
+  -- Beat pulse dot at x=124
+  beat_phase = (beat_phase + 1) % 8
+  local beat_brightness = (beat_phase < 4) and 15 or 3
+  screen.level(beat_brightness)
+  screen.move(124, 4)
+  screen.rect(1, 1)
+  screen.fill()
+  
+  -- ============================================================
+  -- 2. LIVE ZONE (y 9-52): String visualization with decay
+  -- ============================================================
+  local y_start = 9
+  local y_height = 44
+  local string_spacing = y_height / 6
+  
+  -- Draw 6 horizontal lines (strings) at level 3
+  screen.level(3)
+  for s=1,6 do
+    local y_pos = y_start + (s - 1) * string_spacing + 2
+    screen.move(0, y_pos)
+    screen.line(128, y_pos)
+    screen.stroke()
+  end
+  
+  -- Draw chord/voicing name centered above strings
+  local voicing_info = voicing
+  if string_mode ~= "chord" then
+    voicing_info = string_mode
+  end
+  screen.level(12)
+  screen.move(64, y_start - 2)
+  screen.text_center(get_chord_name() .. " (" .. voicing_info .. ")")
+  
+  -- Show active/ringing notes as bright dots on string positions
+  -- Map 16 STRINGS to 6 visual strings (guitar-style)
+  screen.level(10)
+  for i=1,16 do
+    local visual_string = ((i - 1) % 6) + 1
+    local y_pos = y_start + (visual_string - 1) * string_spacing + 2
+    local brightness = get_decay_brightness(i)
+    if brightness > 0 then
+      screen.level(brightness)
+      local x_pos = 8 + (i - 1) * 7
+      screen.move(x_pos, y_pos)
+      screen.circle(1)
+      screen.fill()
+    end
+  end
+  
+  -- FINGERPICK PATTERN: Show pattern as numbered circles when active
+  if pick_mode then
+    screen.level(6)
+    for idx, string_num in ipairs(pick_pattern) do
+      if string_num <= 6 then
+        local y_pos = y_start + (string_num - 1) * string_spacing + 2
+        local x_pos = 8 + (idx - 1) * 8
+        screen.move(x_pos, y_pos)
+        screen.text_center(tostring(string_num))
+      end
+    end
+  end
+  
+  -- VELOCITY INDICATOR
+  if calc_strum_velocity(util.time()) ~= 100 then
+    screen.level(6)
+    screen.move(120, y_start + y_height - 4)
+    screen.text("VEL")
+  end
+  
+  -- ============================================================
+  -- 3. CONTEXT BAR (y 53-58)
+  -- ============================================================
+  screen.level(4)
+  screen.move(0, 62)
+  screen.text("Ch " .. midi_ch .. " | " .. (string_mode == "chord" and voicing or string_mode))
+  
+  screen.level(6)
+  screen.move(64, 62)
+  screen.text_center("P" .. patch .. " | Oct " .. octave .. " Tr " .. transpose)
+  
+  -- ============================================================
+  -- 4. TRANSIENT PARAMETER POPUP
+  -- ============================================================
+  local now = util.time()
+  if popup_param and (now - popup_time) < popup_duration then
+    screen.level(15)
+    screen.move(64, 54)
+    screen.text_center(popup_param .. ": " .. tostring(popup_val))
+  end
+  
+  screen.update()
+end
+
+------------------------------------------------------------
 -- redraw (grid + screen)
 ------------------------------------------------------------
 local function grid_redraw()
@@ -1233,39 +1391,6 @@ local function grid_redraw()
   g:refresh()
 end
 
-local function screen_redraw()
-  screen.clear()
-  screen.level(15)
-
-  screen.move(10,12)
-  screen.text("le_strum v6 ENHANCED "..(shift and "[SET]" or "[PLAY]"))
-
-  screen.move(10,24)
-  screen.text(note_name(root_pc)..\" \"..quality..\" +\"..add_mode..\" pg:\"..chord_page..\" p:\"..patch)
-
-  screen.move(10,36)
-  local voi_str = voicing
-  if string_mode ~= "chord" then voi_str = string_mode end
-  screen.text("Voi:\"..voi_str..\" mode:\"..mode..\" vel:\"..vel_curve)
-
-  screen.move(10,48)
-  screen.text("Oct:\"..octave..\" Tr:\"..transpose..\" Ch:\"..midi_ch..\" Rat:\"..ratchet_count)
-
-  screen.move(10,60)
-  local flags = {}
-  if organ_enabled then flags[#flags+1] = "Org" end
-  if guitar_bass then flags[#flags+1] = "Bass" end
-  if not chord_hold then flags[#flags+1] = "Rel" end
-  if behavior.retrigger_on_chord_change then flags[#flags+1] = "Rtg" end
-  if pick_mode then flags[#flags+1] = "Pick:\"..PICK_NAMES[pick_pattern_idx] end
-  if arp_enabled then flags[#flags+1] = "Arp:\"..arp_div_labels[arp_div_idx] end
-  if drone_enabled then flags[#flags+1] = "Drn" end
-  local flag_str = #flags > 0 and table.concat(flags, " \") or \"---\"
-  screen.text(flag_str)
-
-  screen.update()
-end
-
 ------------------------------------------------------------
 -- norns lifecycle
 ------------------------------------------------------------
@@ -1326,7 +1451,7 @@ function init()
     normal_press(x,y)
   end
 
-  -- refresh loop
+  -- refresh loop: ~12fps for string decay animation
   clock.run(function()
     while true do
       if grid_dirty then
@@ -1334,7 +1459,7 @@ function init()
         grid_dirty = false
       end
       screen_redraw()
-      clock.sleep(1/20)
+      clock.sleep(1/12)
     end
   end)
 end
@@ -1352,9 +1477,15 @@ function enc(n, d)
   local old_pcs = current_chord_pcs()
   if n == 2 then
     transpose = clamp(transpose + d, -24, 24)
+    popup_param = "Transpose"
+    popup_val = transpose
+    popup_time = util.time()
     apply_chord_change(old_pcs)
   elseif n == 3 then
     octave = clamp(octave + d, 0, 8)
+    popup_param = "Octave"
+    popup_val = octave
+    popup_time = util.time()
     apply_chord_change(old_pcs)
   end
   grid_dirty = true
