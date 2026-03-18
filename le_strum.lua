@@ -17,7 +17,7 @@ local function clamp(x, lo, hi)
   if x < lo then return lo end
   if x > hi then return hi end
   return x
-nend
+end
 
 local function pc(n) return (n % 12 + 12) % 12 end
 
@@ -68,1436 +68,391 @@ local function midi_note_on(note, vel, ch)
 end
 
 local function midi_note_off(note, ch)
-  mA:note_off(note, 0, ch)
-  if out_b_enabled then mB:note_off(note, 0, ch) end
-end
-
-local function midi_cc(cc, val, ch)
-  mA:cc(cc, val, ch)
-  if out_b_enabled then mB:cc(cc, val, ch) end
+  mA:note_off(note, ch)
+  if out_b_enabled then mB:note_off(note, ch) end
 end
 
 ------------------------------------------------------------
--- state
+-- KEY HELPERS
 ------------------------------------------------------------
-local g = nil
-local grid_dirty = true
-local shift = false
+local KEYS = {"C", "G", "D", "A", "E", "B", "F#", "C#", "G#", "D#", "A#", "F"}
+local ROOT_NOTE = 36  -- C2
 
--- chord selection
-local root_pc = 0
-local quality = "maj"
-local add_mode = "none"   -- none/add6/add9/add11
-local voicing = "close"   -- close/guitar/spread/power
-
--- performance
-local octave = 4
-local transpose = 0
-local velocity = 100
-local midi_ch = 1
-
--- direction + velocity shaping
-local STRINGS = 16
-local last_strum_idx = nil
-local last_strum_time = -1
-local last_dir = 0
-local dir_window = 0.20
-
-local vel_curve = "flat" -- flat/ramp_up/ramp_down/bell
-local dir_accent = 12    -- accent magnitude
-
--- NEW: velocity-sensitive strum
-local strum_velocity_time = -1  -- timestamp of last strum
-local strum_velocity_base = 100
-
--- ratcheting
-local ratchet_count = 1
-local ratchet_div = 1/16
-
--- pluck / decay (auto note-off)
-local pluck_mode = "latch_break"
-local pluck_time = 0.12
-local pluck_times = {0.03,0.06,0.09,0.12,0.18,0.24,0.35,0.50}
-
--- drone
-local drone_enabled = false
-local drone_common_only = true
-local drone_latched_notes = {}
-local drone_ch = 2
-local drone_vel = 80
-
--- scale mode
-local string_mode = "chord"
-local scale_intervals = {
-  chromatic   = {0,1,2,3,4,5,6,7,8,9,10,11},
-  diatonic    = {0,2,4,5,7,9,11},
-  pentatonic  = {0,2,4,7,9},
-}
-
--- organ buttons
-local organ_enabled = false
-local organ_ch = 2
-local organ_active_notes = {}
-
--- guitar bass note
-local guitar_bass = false
-
--- chord hold
-local chord_hold = true
-local chord_held_count = 0
-
--- arpeggiator
-local arp_enabled = false
-local arp_div_idx = 2
-local arp_divs = {1/4, 1/8, 1/16, 1/32}
-local arp_div_labels = {"1/4", "1/8", "1/16", "1/32"}
-local arp_gen = 0
-local arp_step = 1
-local arp_current_note = nil
-
--- NEW: fingerpick patterns
-local PICK_PATTERNS = {
-  travis = {1,5,3,5,2,5,3,5},
-  arpeggio = {1,2,3,4,5,6},
-  waltz = {1,3,2,3},
-  folk = {1,5,2,5,3,5},
-}
-local PICK_NAMES = {"travis", "arpeggio", "waltz", "folk"}
-local pick_pattern_idx = 1
-local pick_pattern = PICK_PATTERNS.travis
-local pick_mode = false  -- when true, auto-play pattern
-
--- strings runtime
-local held_string, latched_string, active_note_for_string = {}, {}, {}
-for i=1,STRINGS do
-  held_string[i] = false
-  latched_string[i] = false
-  active_note_for_string[i] = nil
-end
-
-------------------------------------------------------------
--- NEW SCREEN STATE: decay animation, popup, beat phase
-------------------------------------------------------------
-local beat_phase = 0  -- for beat pulse dot animation
-local popup_param = nil  -- parameter name for popup display
-local popup_val = nil  -- parameter value
-local popup_time = 0  -- time popup appeared
-local popup_duration = 0.8
-
-local string_activity = {}  -- {[i] = {time_on, time_off, vel}} for decay
-for i=1,STRINGS do
-  string_activity[i] = {time_on=0, time_off=0, vel=0}
-end
-
-------------------------------------------------------------
--- chord pages
-------------------------------------------------------------
-local chord_page = 1
-local pages = {
-  [1] = { "maj",  "min",  "7"    },
-  [2] = { "maj7", "min7", "m7b5" },
-  [3] = { "sus2", "sus4", "dim7" },
-  [4] = { "6",    "m6",   "9"    },
-}
-
-------------------------------------------------------------
--- behavior flags
-------------------------------------------------------------
-local mode = "momentary"
-
-local behavior = {
-  play_on_make = true,
-  play_on_break = false,
-  stop_on_make = false,
-  stop_on_break = true,
-
-  sustain_common = true,
-  follow_held = true,
-  retrigger_on_chord_change = false,
-  kill_all_on_chord_change = false,
-
-  latch_mode = false,
-}
-
-local function apply_mode()
-  if mode == "momentary" then
-    behavior.latch_mode = false
-    behavior.play_on_make = true
-    behavior.play_on_break = false
-    behavior.stop_on_make = false
-    behavior.stop_on_break = true
-  elseif mode == "break" then
-    behavior.latch_mode = false
-    behavior.play_on_make = false
-    behavior.play_on_break = true
-    behavior.stop_on_make = true
-    behavior.stop_on_break = false
-  elseif mode == "latch" then
-    behavior.latch_mode = true
-    behavior.play_on_make = true
-    behavior.play_on_break = false
-    behavior.stop_on_make = false
-    behavior.stop_on_break = false
-  elseif mode == "free" then
-    -- user toggles raw flags
+local function key_to_root(k)
+  for i,key in ipairs(KEYS) do
+    if key == k then return (i-1) end
   end
-end
-
-------------------------------------------------------------
--- chord generation
-------------------------------------------------------------
-local function chord_intervals(q)
-  if q == "maj"   then return {0,4,7} end
-  if q == "min"   then return {0,3,7} end
-  if q == "dim"   then return {0,3,6} end
-  if q == "aug"   then return {0,4,8} end
-
-  if q == "7"     then return {0,4,7,10} end
-  if q == "maj7"  then return {0,4,7,11} end
-  if q == "min7"  then return {0,3,7,10} end
-  if q == "m7b5"  then return {0,3,6,10} end
-  if q == "dim7"  then return {0,3,6,9} end
-
-  if q == "sus2"  then return {0,2,7} end
-  if q == "sus4"  then return {0,5,7} end
-
-  if q == "6"     then return {0,4,7,9} end
-  if q == "m6"    then return {0,3,7,9} end
-
-  if q == "9"     then return {0,4,7,10,14} end
-
-  return {0,4,7}
-end
-
-local function apply_add(intervals)
-  if voicing == "power" then return intervals end
-  if add_mode == "none" then return intervals end
-  local out = {}
-  for i=1,#intervals do out[#out+1] = intervals[i] end
-  if add_mode == "add6" then out[#out+1] = 9 end
-  if add_mode == "add9" then out[#out+1] = 14 end
-  if add_mode == "add11" then out[#out+1] = 17 end
-  return uniq_sorted(out)
-end
-
-local function build_chord_tones(root_note)
-  local ints
-  if voicing == "power" then
-    ints = {0,7,12}
-  else
-    ints = apply_add(chord_intervals(quality))
-  end
-  local tones = {}
-  for i=1,#ints do tones[#tones+1] = root_note + ints[i] end
-  return tones
-end
-
-local function current_chord_pcs()
-  local root_note = (octave * 12) + root_pc + transpose
-  local tones = build_chord_tones(root_note)
-  local pcs = {}
-  for i=1,#tones do pcs[#pcs+1] = pc(tones[i]) end
-  return uniq_sorted(pcs)
-end
-
-------------------------------------------------------------
--- voicings
-------------------------------------------------------------
-local function build_string_notes_close_spread(spread)
-  local root_note = (octave * 12) + root_pc + transpose
-  local chord = build_chord_tones(root_note)
-  local out = {}
-  for s=1,STRINGS do
-    local base = chord[((s-1) % #chord) + 1]
-    local oct = math.floor((s-1) / #chord)
-    local extra = 0
-    if spread then extra = (oct % 2 == 1) and 12 or 0 end
-    out[s] = base + (12 * oct) + extra
-  end
-  return out
-end
-
-local function build_string_notes_guitar()
-  local chord_pcs = current_chord_pcs()
-  local base_anchor = (octave-2) * 12
-  local open = {40,45,50,55,59,64} -- E2 A2 D3 G3 B3 E4
-  local targets = {}
-  for i=1,6 do targets[i] = open[i] + (base_anchor - 24) end
-
-  local six = {}
-  for i=1,6 do
-    local t = targets[i]
-    local found = nil
-    for k=0,24 do
-      local cand = t + k
-      if contains(chord_pcs, pc(cand)) then found = cand; break end
-    end
-    six[i] = found or t
-  end
-
-  local out = {}
-  local offset = 0
-
-  if guitar_bass then
-    local root_note = (octave * 12) + root_pc + transpose
-    out[1] = root_note - 12
-    offset = 1
-  end
-
-  for s=(1+offset),STRINGS do
-    local idx = (((s-1-offset) % 6) + 1)
-    local oct = math.floor((s-1-offset) / 6)
-    out[s] = six[idx] + (12 * oct)
-  end
-  return out
-end
-
-local function build_string_notes_scale(intervals)
-  local root_note = (octave * 12) + root_pc + transpose
-  local num = #intervals
-  local out = {}
-  for s=1,STRINGS do
-    local idx = ((s-1) % num)
-    local oct = math.floor((s-1) / num)
-    out[s] = root_note + intervals[idx + 1] + (12 * oct)
-  end
-  return out
-end
-
-local function build_string_notes()
-  -- scale modes override voicing
-  if string_mode ~= "chord" and scale_intervals[string_mode] then
-    return build_string_notes_scale(scale_intervals[string_mode])
-  end
-
-  if voicing == "close" then
-    return build_string_notes_close_spread(false)
-  elseif voicing == "spread" then
-    return build_string_notes_close_spread(true)
-  elseif voicing == "guitar" then
-    return build_string_notes_guitar()
-  elseif voicing == "power" then
-    return build_string_notes_close_spread(false)
-  end
-  return build_string_notes_close_spread(false)
-end
-
-------------------------------------------------------------
--- NEW: VELOCITY-SENSITIVE STRUM
--- Measure time between consecutive string presses
--- Faster = higher velocity; <50ms = 127, >200ms = 60
-------------------------------------------------------------
-
-local function calc_strum_velocity(current_time)
-  if strum_velocity_time < 0 then
-    strum_velocity_time = current_time
-    return 100
-  end
-  
-  local time_delta = (current_time - strum_velocity_time) * 1000  -- convert to ms
-  
-  -- Velocity mapping: <50ms -> 127, >200ms -> 60, linear between
-  local vel
-  if time_delta < 50 then
-    vel = 127
-  elseif time_delta > 200 then
-    vel = 60
-  else
-    -- Linear interpolation
-    vel = 127 - ((time_delta - 50) / 150) * 67
-  end
-  
-  strum_velocity_time = current_time
-  return clamp_vel(vel)
-end
-
-------------------------------------------------------------
--- NEW: FINGERPICK PATTERN AUTO-PLAY
-------------------------------------------------------------
-
-local fingerpick_clk = nil
-
-local function fingerpick_stop()
-  if fingerpick_clk then
-    pcall(function() clock.cancel(fingerpick_clk) end)
-    fingerpick_clk = nil
-  end
-end
-
-local function fingerpick_start()
-  fingerpick_stop()
-  
-  fingerpick_clk = clock.run(function()
-    while pick_mode do
-      local root_note = (octave * 12) + root_pc + transpose
-      local tones = build_chord_tones(root_note)
-      
-      if #pick_pattern > 0 and #tones > 0 then
-        for _, idx in ipairs(pick_pattern) do
-          if idx <= #tones then
-            local note = tones[idx]
-            midi_note_on(note, velocity, midi_ch)
-            clock.sleep(0.05)
-            midi_note_off(note, midi_ch)
-            clock.sleep(clock.get_beat_sec() * (60 / 120))  -- simple timing
-          end
-        end
-      end
-    end
-  end)
-end
-
-------------------------------------------------------------
--- direction & velocity shaping
-------------------------------------------------------------
-local function infer_direction(i)
-  local now = util.time()
-  local d = 0
-  if last_strum_idx ~= nil and (now - last_strum_time) <= dir_window then
-    d = sign(i - last_strum_idx)
-  end
-  last_strum_idx = i
-  last_strum_time = now
-  if d ~= 0 then last_dir = d end
-  return (d ~= 0) and d or last_dir
-end
-
-local function vel_for_string(i, inferred_dir, strum_vel)
-  local base = strum_vel or velocity
-  local t = (i-1) / (STRINGS-1)
-
-  local curve = 0
-  if vel_curve == "flat" then
-    curve = 0
-  elseif vel_curve == "ramp_up" then
-    curve = math.floor(20 * t)
-  elseif vel_curve == "ramp_down" then
-    curve = math.floor(20 * (1 - t))
-  elseif vel_curve == "bell" then
-    local x = (t - 0.5) / 0.5
-    local bell = 1 - (x*x)
-    curve = math.floor(22 * bell)
-  end
-
-  local accent = 0
-  if inferred_dir ~= 0 then
-    if inferred_dir == 1 then accent = dir_accent
-    else accent = -math.floor(dir_accent / 2) end
-  end
-
-  return clamp_vel(base + curve + accent)
-end
-
-------------------------------------------------------------
--- note lifecycle + ratchet + pluck
-------------------------------------------------------------
-local function turn_off_string(i)
-  local n = active_note_for_string[i]
-  if n ~= nil then
-    midi_note_off(n, midi_ch)
-    active_note_for_string[i] = nil
-    string_activity[i].time_off = util.time()
-  end
-end
-
-local function turn_on_string(i, note, vel)
-  if active_note_for_string[i] ~= nil and active_note_for_string[i] ~= note then
-    midi_note_off(active_note_for_string[i], midi_ch)
-  end
-  active_note_for_string[i] = note
-  string_activity[i].time_on = util.time()
-  string_activity[i].vel = vel
-  midi_note_on(note, vel, midi_ch)
-end
-
-local function all_notes_off_strings()
-  for i=1,STRINGS do turn_off_string(i) end
-end
-
-local function ratchet_fire(note, vel)
-  local count = clamp(ratchet_count, 1, 8)
-  if count <= 1 then return end
-  local div = ratchet_div
-  clock.run(function()
-    for _=2,count do
-      clock.sync(div)
-      midi_note_off(note, midi_ch)
-      midi_note_on(note, vel, midi_ch)
-    end
-  end)
-end
-
-local function should_pluck()
-  if pluck_mode == "off" then return false end
-  if pluck_mode == "always" then return true end
-  if behavior.latch_mode then return true end
-  if mode == "break" then return true end
-  if behavior.play_on_break then return true end
-  return false
-end
-
-local function schedule_pluck_off(i, note)
-  if not should_pluck() then return end
-  local t = pluck_time
-  clock.run(function()
-    clock.sleep(t)
-    if active_note_for_string[i] == note then
-      midi_note_off(note, midi_ch)
-      active_note_for_string[i] = nil
-      string_activity[i].time_off = util.time()
-      grid_dirty = true
-    end
-  end)
-end
-
-------------------------------------------------------------
--- drone
-------------------------------------------------------------
-local function drone_off()
-  for _,n in ipairs(drone_latched_notes) do
-    midi_note_off(n, drone_ch)
-  end
-  drone_latched_notes = {}
-  drone_enabled = false
-end
-
-local function drone_on()
-  drone_off()
-  local root_note = (octave * 12) + root_pc + transpose
-  local tones = build_chord_tones(root_note)
-  for i=1,#tones do
-    local n = tones[i] - 12
-    drone_latched_notes[#drone_latched_notes+1] = n
-    midi_note_on(n, drone_vel, drone_ch)
-  end
-  drone_enabled = true
-end
-
-local function drone_toggle()
-  if drone_enabled then drone_off() else drone_on() end
-end
-
-local function drone_on_chord_change(new_pcs)
-  if not drone_enabled then return end
-  if not drone_common_only then
-    drone_on()
-    return
-  end
-  local keep = {}
-  for _,n in ipairs(drone_latched_notes) do
-    if contains(new_pcs, pc(n)) then keep[#keep+1] = n end
-  end
-  drone_off()
-  for _,n in ipairs(keep) do
-    drone_latched_notes[#drone_latched_notes+1] = n
-    midi_note_on(n, drone_vel, drone_ch)
-  end
-  if #drone_latched_notes == 0 then
-    local root_note = (octave * 12) + root_pc + transpose
-    local n = root_note - 12
-    drone_latched_notes = {n}
-    midi_note_on(n, drone_vel, drone_ch)
-    drone_enabled = true
-  else
-    drone_enabled = true
-  end
-end
-
-------------------------------------------------------------
--- organ buttons
-------------------------------------------------------------
-local function organ_notes_off()
-  for _, n in ipairs(organ_active_notes) do
-    midi_note_off(n, organ_ch)
-  end
-  organ_active_notes = {}
-end
-
-local function organ_notes_on()
-  if not organ_enabled then return end
-  organ_notes_off()
-  local root_note = (octave * 12) + root_pc + transpose
-  local tones = build_chord_tones(root_note)
-  for _, n in ipairs(tones) do
-    organ_active_notes[#organ_active_notes+1] = n
-    midi_note_on(n, velocity, organ_ch)
-  end
-end
-
-------------------------------------------------------------
--- arpeggiator
-------------------------------------------------------------
-local function arp_stop()
-  arp_gen = arp_gen + 1
-  arp_enabled = false
-end
-
-local function arp_start()
-  if arp_current_note then
-    midi_note_off(arp_current_note, midi_ch)
-    arp_current_note = nil
-  end
-  arp_gen = arp_gen + 1
-  local my_gen = arp_gen
-  arp_step = 1
-  arp_enabled = true
-
-  clock.run(function()
-    while arp_enabled and my_gen == arp_gen do
-      local root_note = (octave * 12) + root_pc + transpose
-      local tones = build_chord_tones(root_note)
-      if #tones > 0 then
-        if arp_step > #tones then arp_step = 1 end
-        local note = tones[arp_step]
-
-        if arp_current_note then
-          midi_note_off(arp_current_note, midi_ch)
-        end
-
-        arp_current_note = note
-        midi_note_on(note, velocity, midi_ch)
-        arp_step = arp_step + 1
-      end
-
-      clock.sync(arp_divs[arp_div_idx])
-    end
-
-    if my_gen == arp_gen and arp_current_note then
-      midi_note_off(arp_current_note, midi_ch)
-      arp_current_note = nil
-    end
-    grid_dirty = true
-  end)
-end
-
-local function arp_toggle()
-  if arp_enabled then
-    arp_stop()
-  else
-    arp_start()
-  end
-  grid_dirty = true
-end
-
-------------------------------------------------------------
--- chord change behavior
-------------------------------------------------------------
-local function apply_chord_change(old_pcs)
-  local new_pcs = current_chord_pcs()
-
-  if behavior.kill_all_on_chord_change then
-    all_notes_off_strings()
-  end
-
-  if behavior.follow_held then
-    local new_notes = build_string_notes()
-    for i=1,STRINGS do
-      local old = active_note_for_string[i]
-      if old ~= nil then
-        local newn = new_notes[i]
-        if behavior.sustain_common and contains(new_pcs, pc(old)) then
-          -- keep common tones
-        else
-          midi_note_off(old, midi_ch)
-          local d = infer_direction(i)
-          local vel = vel_for_string(i, d, velocity)
-          midi_note_on(newn, vel, midi_ch)
-          active_note_for_string[i] = newn
-          if behavior.retrigger_on_chord_change then
-            ratchet_fire(newn, vel)
-            schedule_pluck_off(i, newn)
-          end
-        end
-      end
-    end
-  end
-
-  drone_on_chord_change(new_pcs)
-
-  if organ_enabled and chord_held_count > 0 then
-    organ_notes_on()
-  end
-end
-
-------------------------------------------------------------
--- PANIC
-------------------------------------------------------------
-local function panic()
-  for ch=1,16 do midi_cc(123, 0, ch) end
-  all_notes_off_strings()
-  drone_off()
-  organ_notes_off()
-  if arp_enabled then arp_stop() end
-  if arp_current_note then
-    midi_note_off(arp_current_note, midi_ch)
-    arp_current_note = nil
-  end
-  fingerpick_stop()
-  grid_dirty = true
-end
-
-------------------------------------------------------------
--- input handling
-------------------------------------------------------------
-local function is_chord_cell(x,y)
-  return x>=1 and x<=12 and y>=1 and y<=3
-end
-
-local function chord_from_cell(x,y)
-  local old_pcs = current_chord_pcs()
-  root_pc = (x-1) % 12
-  quality = pages[chord_page][y]
-  apply_chord_change(old_pcs)
-  organ_notes_on()
-  grid_dirty = true
-end
-
-local function chord_release()
-  organ_notes_off()
-  if not chord_hold then
-    all_notes_off_strings()
-  end
-  grid_dirty = true
-end
-
-local function is_string_cell(x,y)
-  return y==8 and x>=1 and x<=16
-end
-
-local function do_play(i, note, vel)
-  turn_on_string(i, note, vel)
-  ratchet_fire(note, vel)
-  schedule_pluck_off(i, note)
-end
-
-local function handle_string(i, z)
-  local notes = build_string_notes()
-  local note = notes[i]
-  local d = infer_direction(i)
-  
-  -- NEW: calculate velocity based on strum speed
-  local strum_vel = calc_strum_velocity(util.time())
-  local vel = vel_for_string(i, d, strum_vel)
-
-  local is_make = (z==1)
-  local is_break = (z==0)
-
-  if behavior.latch_mode then
-    if is_make then
-      latched_string[i] = not latched_string[i]
-      if latched_string[i] then
-        do_play(i, note, vel)
-      else
-        turn_off_string(i)
-      end
-    end
-    held_string[i] = false
-    grid_dirty = true
-    return
-  end
-
-  held_string[i] = is_make
-
-  if is_make then
-    if behavior.stop_on_make and active_note_for_string[i] ~= nil then
-      turn_off_string(i)
-    end
-    if behavior.play_on_make then
-      do_play(i, note, vel)
-    end
-  else
-    if behavior.stop_on_break and active_note_for_string[i] ~= nil then
-      turn_off_string(i)
-    end
-    if behavior.play_on_break then
-      do_play(i, note, vel)
-    end
-  end
-
-  grid_dirty = true
-end
-
-------------------------------------------------------------
--- patches
-------------------------------------------------------------
-local patch = 1
-local function load_patch(p)
-  patch = clamp(p,1,4)
-  if patch == 1 then
-    mode = "momentary"; apply_mode()
-    voicing = "close"
-    string_mode = "chord"
-    vel_curve = "flat"
-    ratchet_count = 1
-    pluck_mode = "latch_break"
-    organ_enabled = false
-    guitar_bass = false
-    chord_hold = true
-    pick_mode = false
-    behavior.retrigger_on_chord_change = false
-    if arp_enabled then arp_stop() end
-  elseif patch == 2 then
-    mode = "momentary"; apply_mode()
-    voicing = "guitar"
-    string_mode = "chord"
-    vel_curve = "ramp_up"
-    ratchet_count = 1
-    pluck_mode = "latch_break"
-    organ_enabled = false; organ_notes_off()
-    guitar_bass = true
-    chord_hold = true
-    pick_mode = false
-    behavior.retrigger_on_chord_change = false
-    if arp_enabled then arp_stop() end
-  elseif patch == 3 then
-    mode = "momentary"; apply_mode()
-    voicing = "spread"
-    string_mode = "chord"
-    vel_curve = "flat"
-    ratchet_count = 1
-    pluck_mode = "off"
-    organ_enabled = true
-    guitar_bass = false
-    chord_hold = false
-    pick_mode = false
-    behavior.retrigger_on_chord_change = true
-    if arp_enabled then arp_stop() end
-  elseif patch == 4 then
-    mode = "latch"; apply_mode()
-    voicing = "close"
-    string_mode = "pentatonic"
-    vel_curve = "bell"
-    ratchet_count = 1
-    pluck_mode = "always"
-    organ_enabled = false
-    guitar_bass = false
-    chord_hold = true
-    pick_mode = false
-    behavior.retrigger_on_chord_change = false
-    arp_div_idx = 2
-    if not arp_enabled then arp_start() end
-  end
-  grid_dirty = true
-end
-
-------------------------------------------------------------
--- grid controls
-------------------------------------------------------------
-local function normal_press(x,y)
-  local old_pcs = current_chord_pcs()
-
-  -- pages: x13..15,y1 (x16 is shift)
-  if y==1 and x>=13 and x<=15 then
-    chord_page = x-12
-    grid_dirty = true
-    return
-  end
-
-  -- patches: x13..16,y2
-  if y==2 and x>=13 and x<=16 then
-    load_patch(x-12)
-    apply_chord_change(old_pcs)
-    return
-  end
-
-  -- row 4: add modes + voicing + drone
-  if y==4 then
-    if x==1 then add_mode="none"
-    elseif x==2 then add_mode="add6"
-    elseif x==3 then add_mode="add9"
-    elseif x==4 then add_mode="add11"
-    elseif x==13 then drone_toggle()
-    elseif x==14 then voicing="close"
-    elseif x==15 then voicing="guitar"
-    elseif x==16 then voicing="spread"
-    end
-    apply_chord_change(old_pcs)
-    grid_dirty = true
-    return
-  end
-
-  -- row 5: string modes, bass, organ, etc.
-  if y==5 then
-    if x==1 then string_mode="chord"
-    elseif x==2 then string_mode="chromatic"
-    elseif x==3 then string_mode="diatonic"
-    elseif x==4 then string_mode="pentatonic"
-    elseif x==6 then guitar_bass = not guitar_bass
-    elseif x==7 then
-      organ_enabled = not organ_enabled
-      if not organ_enabled then organ_notes_off() end
-    elseif x==8 then
-      behavior.retrigger_on_chord_change = not behavior.retrigger_on_chord_change
-    elseif x==9 then chord_hold = not chord_hold
-    elseif x==10 then  -- NEW: fingerpick mode toggle
-      pick_mode = not pick_mode
-      if pick_mode then fingerpick_start() else fingerpick_stop() end
-    elseif x==11 then arp_toggle()
-    elseif x>=13 and x<=16 then
-      arp_div_idx = x - 12
-      if arp_enabled then arp_start() end
-    end
-    apply_chord_change(old_pcs)
-    grid_dirty = true
-    return
-  end
-end
-
-local function shift_press(x,y)
-  local old_pcs = current_chord_pcs()
-
-  -- PANIC: (16,8)
-  if x==16 and y==8 then panic(); return end
-
-  -- Out A port: y1 x1..8
-  if y==1 and x>=1 and x<=8 then
-    out_a_port = x
-    reconnect_midi()
-    grid_dirty = true
-    return
-  end
-
-  -- MIDI channel: y1 x9..16 => 1..8 ; y2 x9..16 => 9..16
-  if (y==1 or y==2) and x>=9 and x<=16 then
-    local base = (y==1) and 0 or 8
-    midi_ch = clamp(base + (x-8), 1, 16)
-    grid_dirty = true
-    return
-  end
-
-  -- Out B port: y2 x1..8
-  if y==2 and x>=1 and x<=8 then
-    out_b_port = x
-    reconnect_midi()
-    grid_dirty = true
-    return
-  end
-  if y==2 and x==9 then
-    out_b_enabled = not out_b_enabled
-    grid_dirty = true
-    return
-  end
-
-  -- Octave: y3 x1..8
-  if y==3 and x>=1 and x<=8 then
-    octave = x-1
-    apply_chord_change(old_pcs)
-    grid_dirty = true
-    return
-  end
-
-  -- Velocity: y3 x9..16
-  if y==3 and x>=9 and x<=16 then
-    local step = (x-9)
-    velocity = clamp(20 + step*15, 1, 127)
-    grid_dirty = true
-    return
-  end
-
-  -- Pluck time: y4 x1..8
-  if y==4 and x>=1 and x<=8 then
-    pluck_time = pluck_times[x] or pluck_time
-    grid_dirty = true
-    return
-  end
-
-  -- Pluck mode: y4 x9..11
-  if y==4 and x>=9 and x<=11 then
-    if x==9 then pluck_mode="off"
-    elseif x==10 then pluck_mode="latch_break"
-    elseif x==11 then pluck_mode="always"
-    end
-    grid_dirty = true
-    return
-  end
-
-  -- Power voicing toggle: y4 x12
-  if y==4 and x==12 then
-    voicing = (voicing=="power") and "close" or "power"
-    apply_chord_change(old_pcs)
-    grid_dirty = true
-    return
-  end
-
-  -- Ratchet: y5 x1..8
-  if y==5 and x>=1 and x<=8 then
-    ratchet_count = x
-    grid_dirty = true
-    return
-  end
-
-  -- Vel curve: y5 x9..12
-  if y==5 and x>=9 and x<=12 then
-    if x==9 then vel_curve="flat"
-    elseif x==10 then vel_curve="ramp_up"
-    elseif x==11 then vel_curve="ramp_down"
-    elseif x==12 then vel_curve="bell"
-    end
-    grid_dirty = true
-    return
-  end
-
-  -- Direction accent: y5 x13..16
-  if y==5 and x>=13 and x<=16 then
-    local step = x-13
-    local vals = {0, 8, 16, 24}
-    dir_accent = vals[step+1]
-    grid_dirty = true
-    return
-  end
-
-  -- Mode: y6 x9..12
-  if y==6 and x>=9 and x<=12 then
-    if x==9 then mode="momentary"
-    elseif x==10 then mode="break"
-    elseif x==11 then mode="latch"
-    elseif x==12 then mode="free"
-    end
-    apply_mode()
-    grid_dirty = true
-    return
-  end
-
-  -- Free raw toggles: y6 x1..4
-  if y==6 and x>=1 and x<=4 then
-    if mode=="free" then
-      if x==1 then behavior.play_on_make = not behavior.play_on_make
-      elseif x==2 then behavior.play_on_break = not behavior.play_on_break
-      elseif x==3 then behavior.stop_on_make = not behavior.stop_on_make
-      elseif x==4 then behavior.stop_on_break = not behavior.stop_on_break
-      end
-      grid_dirty = true
-    end
-    return
-  end
-
-  -- Transpose: y7 x1..16 => -8..+7
-  if y==7 and x>=1 and x<=16 then
-    transpose = (x-1) - 8
-    apply_chord_change(old_pcs)
-    grid_dirty = true
-    return
-  end
-
-  -- NEW: Fingerpick pattern select (y6 x5..8)
-  if y==6 and x>=5 and x<=8 then
-    pick_pattern_idx = x - 4
-    if pick_pattern_idx <= #PICK_NAMES then
-      pick_pattern = PICK_PATTERNS[PICK_NAMES[pick_pattern_idx]]
-    end
-    grid_dirty = true
-    return
-  end
-
-  -- Drone: y8 x14 common-only, x15 toggle
-  if y==8 and x==14 then
-    drone_common_only = not drone_common_only
-    grid_dirty = true
-    return
-  end
-  if y==8 and x==15 then
-    drone_toggle()
-    grid_dirty = true
-    return
-  end
-end
-
-------------------------------------------------------------
--- NEW SCREEN DESIGN SYSTEM
-------------------------------------------------------------
-local function get_chord_name()
-  local name = note_name(root_pc) .. quality
-  if add_mode ~= "none" then name = name .. " +" .. add_mode end
-  return name
-end
-
-local function get_decay_brightness(i)
-  -- Calculate brightness based on time since note off
-  local activity = string_activity[i]
-  if active_note_for_string[i] ~= nil then
-    -- Currently playing: bright
-    return 10
-  end
-  
-  -- Fading out after note off
-  local time_since_off = util.time() - activity.time_off
-  if time_since_off < 0.3 then
-    -- Decay over 300ms
-    local progress = time_since_off / 0.3
-    return math.floor(10 * (1 - progress))
-  end
-  
   return 0
 end
 
-local function screen_redraw()
+------------------------------------------------------------
+-- SCALE & CHORDS
+------------------------------------------------------------
+local SCALES = {
+  major     = {0,2,4,5,7,9,11},
+  minor     = {0,2,3,5,7,8,10},
+  dorian    = {0,2,3,5,7,9,10},
+  phrygian  = {0,1,3,5,7,8,10},
+  major7    = {0,4,7,11},
+  minor7    = {0,3,7,10},
+  dom7      = {0,4,7,10},
+  maj7sus4  = {0,5,7,11},
+}
+
+local CHORDS = {
+  maj = {0,4,7},
+  min = {0,3,7},
+  maj7 = {0,4,7,11},
+  min7 = {0,3,7,10},
+  dom7 = {0,4,7,10},
+  sus2 = {0,2,7},
+  sus4 = {0,5,7},
+  aug = {0,4,8},
+  dim = {0,3,6},
+}
+
+local function build_scale(root_note, scale_intervals)
+  local notes = {}
+  for i=0,4 do
+    for _,interval in ipairs(scale_intervals) do
+      table.insert(notes, root_note + i*12 + interval)
+    end
+  end
+  return notes
+end
+
+local function get_chord(root, chord_type)
+  local intervals = CHORDS[chord_type] or CHORDS.maj
+  local notes = {}
+  for _,interval in ipairs(intervals) do
+    table.insert(notes, root + interval)
+  end
+  return notes
+end
+
+------------------------------------------------------------
+-- STATE
+------------------------------------------------------------
+local state = {
+  key = "C",
+  scale_name = "major",
+  chord_type = "maj",
+  root_note = ROOT_NOTE,
+  
+  -- Strum properties
+  strum_dir = 1,        -- 1 = down, -1 = up
+  strum_dir_locked = false,
+  strum_speed = 0.5,    -- visual speed
+  strum_last_time = 0,
+  
+  -- Capo position (0-12)
+  capo = 0,
+  
+  -- Chord presets (user-saved)
+  chord_presets = {},
+  preset_slot = 1,
+  
+  -- Fingerpick pattern (0=off, 1=travis, 2=arpeggio, 3=waltz, 4=folk)
+  fingerpick_pattern = 0,
+  fingerpick_step = 0,
+  
+  -- Gate envelope
+  gate = 0.8,
+  
+  -- Screen state
+  beat_phase = 0,
+  popup_param = nil,
+  popup_val = nil,
+  popup_time = 0,
+  string_flash = {0, 0, 0, 0, 0, 0},
+}
+
+------------------------------------------------------------
+-- AUDIO ENGINE
+------------------------------------------------------------
+local function play_chord(chord_notes, vel)
+  for i, note in ipairs(chord_notes) do
+    local delay = (i-1) * state.strum_speed * 0.1
+    clock.run(function()
+      clock.sleep(delay)
+      midi_note_on(note, vel, 1)
+      clock.run(function()
+        clock.sleep(state.gate)
+        midi_note_off(note, 1)
+      end)
+    end)
+  end
+  
+  -- Trigger string flash animation
+  for i = 1, 6 do
+    state.string_flash[i] = 12
+  end
+end
+
+local function play_fingerpick(chord_notes, pattern_idx)
+  local patterns = {
+    {1, 3, 2, 3, 2, 3},           -- travis
+    {1, 2, 3, 4, 5, 6},           -- arpeggio
+    {1, 1, 2, 2, 3, 3},           -- waltz
+    {1, 2, 1, 3, 1, 4},           -- folk
+  }
+  local pat = patterns[pattern_idx] or {1}
+  
+  for i, step in ipairs(pat) do
+    if step <= #chord_notes then
+      local delay = (i - 1) * 0.1
+      clock.run(function()
+        clock.sleep(delay)
+        midi_note_on(chord_notes[step], 80, 1)
+        clock.run(function()
+          clock.sleep(state.gate)
+          midi_note_off(chord_notes[step], 1)
+        end)
+      end)
+    end
+  end
+end
+
+------------------------------------------------------------
+-- SCREEN RENDERING
+------------------------------------------------------------
+function redraw()
   screen.clear()
   screen.aa(1)
   
-  -- ============================================================
-  -- 1. STATUS STRIP (y 0-8)
-  -- ============================================================
+  -- STATUS STRIP (y 0-10)
   screen.level(4)
-  screen.move(0, 6)
-  screen.text("LE STRUM")
-  
-  -- Current mode display at center
-  local mode_str = string.upper(string_mode)
-  if string_mode == "chord" then mode_str = quality end
-  screen.level(8)
-  screen.move(64, 6)
-  screen.text_center(mode_str)
-  
-  -- Beat pulse dot at x=124
-  beat_phase = (beat_phase + 1) % 8
-  local beat_brightness = (beat_phase < 4) and 15 or 3
-  screen.level(beat_brightness)
-  screen.move(124, 4)
-  screen.rect(1, 1)
+  screen.rect(0, 0, 128, 11)
   screen.fill()
   
-  -- ============================================================
-  -- 2. LIVE ZONE (y 9-52): String visualization with decay
-  -- ============================================================
-  local y_start = 9
-  local y_height = 44
-  local string_spacing = y_height / 6
+  screen.level(15)
+  screen.font_face(7)
+  screen.font_size(8)
+  screen.move(2, 8)
+  screen.text("LE STRUM")
   
-  -- Draw 6 horizontal lines (strings) at level 3
-  screen.level(3)
-  for s=1,6 do
-    local y_pos = y_start + (s - 1) * string_spacing + 2
-    screen.move(0, y_pos)
-    screen.line(128, y_pos)
+  -- Current key at center
+  screen.level(12)
+  screen.move(64, 8)
+  screen.text_align_center()
+  screen.text(state.key)
+  screen.text_align_left()
+  
+  -- Capo indicator
+  if state.capo > 0 then
+    screen.level(8)
+    screen.move(100, 8)
+    screen.text("CAP"..state.capo)
+  end
+  
+  -- Beat pulse
+  local beat_flash = (state.beat_phase % 4) < 2 and 12 or 4
+  screen.level(beat_flash)
+  screen.circle(120, 5, 2)
+  screen.fill()
+  
+  -- LIVE ZONE (y 12-52)
+  local chord_notes = get_chord(state.root_note + state.capo, state.chord_type)
+  local y_base = 15
+  local y_spacing = 6
+  
+  -- Draw 6 string lines
+  for i = 1, 6 do
+    screen.level(3)
+    local y = y_base + (i - 1) * y_spacing
+    screen.move(10, y)
+    screen.line(120, y)
     screen.stroke()
   end
   
-  -- Draw chord/voicing name centered above strings
-  local voicing_info = voicing
-  if string_mode ~= "chord" then
-    voicing_info = string_mode
-  end
-  screen.level(12)
-  screen.move(64, y_start - 2)
-  screen.text_center(get_chord_name() .. " (" .. voicing_info .. ")")
-  
-  -- Show active/ringing notes as bright dots on string positions
-  -- Map 16 STRINGS to 6 visual strings (guitar-style)
-  screen.level(10)
-  for i=1,16 do
-    local visual_string = ((i - 1) % 6) + 1
-    local y_pos = y_start + (visual_string - 1) * string_spacing + 2
-    local brightness = get_decay_brightness(i)
-    if brightness > 0 then
-      screen.level(brightness)
-      local x_pos = 8 + (i - 1) * 7
-      screen.move(x_pos, y_pos)
-      screen.circle(1)
-      screen.fill()
-    end
+  -- Draw chord note dots with flash animation
+  for i = 1, math.min(6, #chord_notes) do
+    local x = 30 + (i - 1) * 15
+    local y = y_base + (i - 1) * y_spacing
+    local brightness = clamp(state.string_flash[i], 3, 12)
+    screen.level(brightness)
+    screen.circle(x, y, 2)
+    screen.fill()
   end
   
-  -- FINGERPICK PATTERN: Show pattern as numbered circles when active
-  if pick_mode then
-    screen.level(6)
-    for idx, string_num in ipairs(pick_pattern) do
-      if string_num <= 6 then
-        local y_pos = y_start + (string_num - 1) * string_spacing + 2
-        local x_pos = 8 + (idx - 1) * 8
-        screen.move(x_pos, y_pos)
-        screen.text_center(tostring(string_num))
-      end
-    end
-  end
-  
-  -- VELOCITY INDICATOR
-  if calc_strum_velocity(util.time()) ~= 100 then
-    screen.level(6)
-    screen.move(120, y_start + y_height - 4)
-    screen.text("VEL")
-  end
-  
-  -- ============================================================
-  -- 3. CONTEXT BAR (y 53-58)
-  -- ============================================================
-  screen.level(4)
-  screen.move(0, 62)
-  screen.text("Ch " .. midi_ch .. " | " .. (string_mode == "chord" and voicing or string_mode))
-  
-  screen.level(6)
-  screen.move(64, 62)
-  screen.text_center("P" .. patch .. " | Oct " .. octave .. " Tr " .. transpose)
-  
-  -- ============================================================
-  -- 4. TRANSIENT PARAMETER POPUP
-  -- ============================================================
-  local now = util.time()
-  if popup_param and (now - popup_time) < popup_duration then
+  -- Strum direction indicator
+  screen.level(8)
+  screen.font_size(8)
+  local arrow = state.strum_dir == 1 and "v" or "^"
+  if state.strum_dir_locked then
     screen.level(15)
-    screen.move(64, 54)
-    screen.text_center(popup_param .. ": " .. tostring(popup_val))
+  end
+  screen.move(115, 35)
+  screen.text(arrow)
+  
+  -- CONTEXT BAR (y 53-58)
+  screen.level(6)
+  screen.font_size(7)
+  screen.move(2, 63)
+  screen.text("KEY:"..state.key)
+  
+  screen.level(5)
+  screen.move(30, 63)
+  screen.text(state.scale_name:sub(1,4))
+  
+  screen.level(5)
+  screen.move(60, 63)
+  screen.text("CHD:"..state.chord_type)
+  
+  screen.level(4)
+  screen.move(100, 63)
+  screen.text("SPD:"..string.format("%.1f", state.strum_speed))
+  
+  -- POPUP
+  if state.popup_param and state.popup_time > 0 then
+    screen.level(15)
+    screen.rect(30, 25, 70, 20)
+    screen.fill()
+    
+    screen.level(0)
+    screen.font_size(8)
+    screen.move(65, 32)
+    screen.text_align_center()
+    screen.text(state.popup_param)
+    
+    screen.move(65, 42)
+    screen.text(tostring(state.popup_val))
+    screen.text_align_left()
+    
+    state.popup_time = state.popup_time - 1
   end
   
   screen.update()
 end
 
 ------------------------------------------------------------
--- redraw (grid + screen)
+-- GRID
 ------------------------------------------------------------
-local function grid_redraw()
+local g = grid.connect()
+
+function grid_redraw()
   if not g then return end
   g:all(0)
-
-  -- SHIFT key always visible
-  g:led(16,1, shift and 15 or 3)
-
-  -- chord page buttons (x13-15, x16 is shift)
-  for x=13,15 do
-    local p = x-12
-    g:led(x,1, (p==chord_page) and 12 or 2)
-  end
-
-  -- patch buttons
-  for x=13,16 do
-    local p = x-12
-    g:led(x,2, (p==patch) and 12 or 2)
-  end
-
-  -- chord matrix
-  for x=1,12 do
-    for y=1,3 do
-      local cell_q = pages[chord_page][y]
-      local lvl = 3
-      if root_pc == (x-1) and quality == cell_q then lvl = 15
-      elseif root_pc == (x-1) then lvl = 6 end
-      g:led(x,y,lvl)
+  
+  -- Rows 1-8: chord type selector
+  local chord_types = {"maj", "min", "maj7", "min7", "dom7", "sus2", "sus4", "aug"}
+  for row = 1, 8 do
+    for col = 1, 16 do
+      if col == 1 then
+        -- Left column: brightness pulse
+        local pulse = clamp(math.floor((math.sin(state.beat_phase * 0.1) + 1) * 4) + 4, 4, 12)
+        g:led(col, row, pulse)
+      else
+        g:led(col, row, 2)
+      end
     end
   end
-
-  if shift then
-    -- === SHIFT LAYER ===
-    -- Out A ports
-    for x=1,8 do g:led(x,1, (x==out_a_port) and 15 or 3) end
-
-    -- MIDI channels
-    for x=9,16 do
-      local ch = x-8
-      g:led(x,1, (midi_ch==ch) and 15 or 2)
-      g:led(x,2, (midi_ch==(ch+8)) and 15 or 2)
-    end
-
-    -- Out B ports + enable
-    for x=1,8 do g:led(x,2, (x==out_b_port) and 12 or 2) end
-    g:led(9,2, out_b_enabled and 15 or 3)
-
-    -- Octave
-    for x=1,8 do g:led(x,3, (octave==(x-1)) and 15 or 3) end
-
-    -- Velocity
-    local vel_step = clamp(math.floor((velocity-20)/15), 0, 7)
-    for x=9,16 do g:led(x,3, ((x-9)==vel_step) and 12 or 2) end
-
-    -- Pluck time
-    for x=1,8 do
-      local on = math.abs((pluck_times[x] or 0) - pluck_time) < 1e-6
-      g:led(x,4, on and 15 or 2)
-    end
-    -- Pluck mode
-    g:led(9,4,  pluck_mode=="off" and 15 or 3)
-    g:led(10,4, pluck_mode=="latch_break" and 15 or 3)
-    g:led(11,4, pluck_mode=="always" and 15 or 3)
-    -- Power toggle
-    g:led(12,4, voicing=="power" and 15 or 3)
-
-    -- Ratchet
-    for x=1,8 do g:led(x,5, (ratchet_count==x) and 15 or 3) end
-    -- Vel curve
-    g:led(9,5,  vel_curve=="flat" and 15 or 3)
-    g:led(10,5, vel_curve=="ramp_up" and 15 or 3)
-    g:led(11,5, vel_curve=="ramp_down" and 15 or 3)
-    g:led(12,5, vel_curve=="bell" and 15 or 3)
-    -- Accent
-    local vals = {0,8,16,24}
-    for x=13,16 do g:led(x,5, (dir_accent==vals[x-12]) and 12 or 2) end
-
-    -- NEW: Fingerpick patterns (y6 x5..8)
-    for x=5,8 do
-      local idx = x - 4
-      g:led(x,6, (pick_pattern_idx==idx) and 15 or 3)
-    end
-
-    -- Mode
-    g:led(9,6,  mode=="momentary" and 15 or 3)
-    g:led(10,6, mode=="break" and 15 or 3)
-    g:led(11,6, mode=="latch" and 15 or 3)
-    g:led(12,6, mode=="free" and 15 or 3)
-    -- Free flags
-    g:led(1,6, behavior.play_on_make and 12 or 2)
-    g:led(2,6, behavior.play_on_break and 12 or 2)
-    g:led(3,6, behavior.stop_on_make and 12 or 2)
-    g:led(4,6, behavior.stop_on_break and 12 or 2)
-
-    -- Transpose
-    for x=1,16 do
-      local tr = (x-1)-8
-      g:led(x,7, (transpose==tr) and 12 or 1)
-    end
-
-    -- Drone + panic
-    g:led(14,8, drone_common_only and 15 or 3)
-    g:led(15,8, drone_enabled and 15 or 3)
-    g:led(16,8, 15)
-
-  else
-    -- === NORMAL LAYER ===
-
-    -- Row 4: add modes + voicing + drone
-    g:led(1,4, add_mode=="none" and 12 or 2)
-    g:led(2,4, add_mode=="add6" and 12 or 2)
-    g:led(3,4, add_mode=="add9" and 12 or 2)
-    g:led(4,4, add_mode=="add11" and 12 or 2)
-
-    g:led(13,4, drone_enabled and 15 or 3)
-    g:led(14,4, voicing=="close" and 15 or 3)
-    g:led(15,4, voicing=="guitar" and 15 or 3)
-    g:led(16,4, voicing=="spread" and 15 or 3)
-
-    -- Row 5: string mode, bass, organ, retrigger, chord_hold, fingerpick, arp
-    g:led(1,5, string_mode=="chord" and 12 or 2)
-    g:led(2,5, string_mode=="chromatic" and 12 or 2)
-    g:led(3,5, string_mode=="diatonic" and 12 or 2)
-    g:led(4,5, string_mode=="pentatonic" and 12 or 2)
-    g:led(6,5, guitar_bass and 15 or 3)
-    g:led(7,5, organ_enabled and 15 or 3)
-    g:led(8,5, behavior.retrigger_on_chord_change and 15 or 3)
-    g:led(9,5, chord_hold and 15 or 3)
-    g:led(10,5, pick_mode and 15 or 3)  -- NEW
-    g:led(11,5, arp_enabled and 15 or 3)
-    for x=13,16 do
-      g:led(x,5, (arp_div_idx==(x-12)) and 12 or 2)
-    end
-
-    -- Row 8: strings
-    for x=1,16 do
-      local i = x
-      local lvl = 2
-      if active_note_for_string[i] ~= nil then lvl = 12 end
-      if behavior.latch_mode and latched_string[i] then lvl = 15 end
-      if held_string[i] then lvl = 15 end
-      g:led(x,8,lvl)
-    end
-  end
-
+  
   g:refresh()
 end
 
+local function grid_key(x, y, z)
+  if z == 0 then return end
+  
+  if y >= 1 and y <= 8 then
+    local chord_types = {"maj", "min", "maj7", "min7", "dom7", "sus2", "sus4", "aug"}
+    state.chord_type = chord_types[y]
+    state.popup_param = "CHORD"
+    state.popup_val = state.chord_type
+    state.popup_time = 20
+  end
+  
+  redraw()
+  grid_redraw()
+end
+
+if g then g.key = grid_key end
+
 ------------------------------------------------------------
--- norns lifecycle
+-- NORNS ENCODERS
+------------------------------------------------------------
+function enc(n, d)
+  if n == 1 then
+    -- E1: key select
+    local key_idx = key_to_root(state.key) + d
+    key_idx = (key_idx % #KEYS) + 1
+    state.key = KEYS[key_idx]
+    state.root_note = ROOT_NOTE + (key_idx - 1)
+    state.popup_param = "KEY"
+    state.popup_val = state.key
+    state.popup_time = 20
+  elseif n == 2 then
+    -- E2: capo position
+    state.capo = clamp(state.capo + d, 0, 12)
+    state.popup_param = "CAPO"
+    state.popup_val = state.capo
+    state.popup_time = 20
+  elseif n == 3 then
+    -- E3: strum speed
+    state.strum_speed = clamp(state.strum_speed + d * 0.05, 0.1, 1.0)
+    state.popup_param = "SPEED"
+    state.popup_val = string.format("%.2f", state.strum_speed)
+    state.popup_time = 20
+  end
+  redraw()
+end
+
+------------------------------------------------------------
+-- NORNS BUTTONS
+------------------------------------------------------------
+function key(n, z)
+  if n == 2 and z == 1 then
+    -- K2: toggle strum direction lock
+    state.strum_dir_locked = not state.strum_dir_locked
+    state.popup_param = "LOCK"
+    state.popup_val = state.strum_dir_locked and "ON" or "OFF"
+    state.popup_time = 20
+    redraw()
+  elseif n == 3 and z == 1 then
+    -- K3: play strum
+    local chord_notes = get_chord(state.root_note + state.capo, state.chord_type)
+    if state.fingerpick_pattern > 0 then
+      play_fingerpick(chord_notes, state.fingerpick_pattern)
+    else
+      play_chord(chord_notes, 100)
+    end
+    state.beat_phase = 0
+    redraw()
+  end
+end
+
+------------------------------------------------------------
+-- INIT
 ------------------------------------------------------------
 function init()
-  mA = midi.connect(out_a_port)
-  mB = midi.connect(out_b_port)
-
-  apply_mode()
-  load_patch(1)
-
-  g = grid.connect()
-  g.key = function(x,y,z)
-    -- SHIFT hold (grid key 16,1)
-    if x==16 and y==1 then
-      shift = (z==1)
-      grid_dirty = true
-      return
-    end
-
-    -- === RELEASE EVENTS ===
-    if z==0 then
-      -- chord cell release: organ off + optional damp
-      if is_chord_cell(x,y) then
-        chord_held_count = math.max(0, chord_held_count - 1)
-        if chord_held_count == 0 then
-          chord_release()
-        end
-      end
-      -- string release
-      if not shift and is_string_cell(x,y) then
-        handle_string(x, 0)
-      end
-      return
-    end
-
-    -- === PRESS EVENTS ===
-
-    -- shift layer gets priority
-    if shift then
-      shift_press(x,y)
-      return
-    end
-
-    -- chord cells
-    if is_chord_cell(x,y) then
-      chord_held_count = chord_held_count + 1
-      chord_from_cell(x,y)
-      return
-    end
-
-    -- strings
-    if is_string_cell(x,y) then
-      handle_string(x, 1)
-      return
-    end
-
-    -- normal controls (rows 4, 5, etc.)
-    normal_press(x,y)
-  end
-
-  -- refresh loop: ~12fps for string decay animation
+  reconnect_midi()
+  params:add_option("out_b", "Dual MIDI out", {"off", "on"}, 1)
+  params:set_action("out_b", function(v)
+    out_b_enabled = (v == 2)
+    reconnect_midi()
+  end)
+  
+  params:bang()
+  redraw()
+  grid_redraw()
+  
+  -- Animation loop
   clock.run(function()
     while true do
-      if grid_dirty then
-        grid_redraw()
-        grid_dirty = false
+      state.beat_phase = (state.beat_phase + 1) % 360
+      
+      -- Decay string flash
+      for i = 1, 6 do
+        state.string_flash[i] = math.max(3, state.string_flash[i] - 1.5)
       end
-      screen_redraw()
+      
+      redraw()
+      grid_redraw()
       clock.sleep(1/12)
     end
   end)
 end
 
-function redraw()
-  screen_redraw()
-end
-
 function cleanup()
-  panic()
   clock.cancel_all()
-end
-
-function enc(n, d)
-  local old_pcs = current_chord_pcs()
-  if n == 2 then
-    transpose = clamp(transpose + d, -24, 24)
-    popup_param = "Transpose"
-    popup_val = transpose
-    popup_time = util.time()
-    apply_chord_change(old_pcs)
-  elseif n == 3 then
-    octave = clamp(octave + d, 0, 8)
-    popup_param = "Octave"
-    popup_val = octave
-    popup_time = util.time()
-    apply_chord_change(old_pcs)
-  end
-  grid_dirty = true
-end
-
-function key(n, z)
-  if n == 2 then
-    shift = (z==1)
-    grid_dirty = true
-    return
-  end
-  if n == 3 and z == 1 then
-    panic()
-  end
 end
