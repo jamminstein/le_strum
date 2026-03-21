@@ -3,6 +3,7 @@
 -- Features: scale mode, organ buttons, guitar bass, chord hold,
 --           retrigger on chord change, clock-synced arpeggiator
 --
+engine.name = "MollyThePoly"
 -- NEW FEATURES:
 -- - Velocity-sensitive strum: measure time between column presses, map to velocity
 -- - Fingerpick patterns: named patterns (travis, arpeggio, waltz, folk)
@@ -489,7 +490,6 @@ end
 -- INIT
 ------------------------------------------------------------
 function init()
-  engine.name = "MollyThePoly"
   
   params:add_separator("OP-XY")
   params:add_option("opxy_enabled", "OP-XY output", {"off", "on"}, 1)
@@ -529,7 +529,7 @@ end
 function cleanup()
   engine.noteKillAll()
   if opxy_out and params:get("opxy_enabled") == 2 then
-    opxy_out:all_notes_off(params:get("opxy_channel"))
+    for ch=1,16 do opxy_out:cc(123, 0, ch) end
   end
   clock.cancel_all()
 end
