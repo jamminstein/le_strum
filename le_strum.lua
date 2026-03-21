@@ -7,6 +7,7 @@
 -- - Velocity-sensitive strum: measure time between column presses, map to velocity
 -- - Fingerpick patterns: named patterns (travis, arpeggio, waltz, folk)
 -- - NEW SCREEN DESIGN: Status strip, live zone with string decay animation, context bar, parameter popup
+-- - Internal Engine: MollyThePoly for polyphonic sound output
 
 -- midi and grid are norns globals, no require needed
 
@@ -47,6 +48,10 @@ end
 
 local function clamp_vel(v) return clamp(math.floor(v + 0.5), 1, 127) end
 
+local function midi_to_hz(note)
+  return 440 * 2^((note - 69) / 12)
+end
+
 ------------------------------------------------------------
 -- MIDI outputs (dual)
 ------------------------------------------------------------
@@ -70,6 +75,18 @@ end
 local function midi_note_off(note, ch)
   mA:note_off(note, ch)
   if out_b_enabled then mB:note_off(note, ch) end
+end
+
+------------------------------------------------------------
+-- INTERNAL ENGINE (MollyThePoly)
+------------------------------------------------------------
+local function engine_note_on(note, vel)
+  local freq = midi_to_hz(note)
+  engine.noteOn(note, freq, vel / 127)
+end
+
+local function engine_note_off(note)
+  engine.noteOff(note)
 end
 
 ------------------------------------------------------------
@@ -175,10 +192,16 @@ local function play_chord(chord_notes, vel)
     local delay = (i-1) * state.strum_speed * 0.1
     clock.run(function()
       clock.sleep(delay)
+      -- MIDI output
       midi_note_on(note, vel, 1)
+      -- Internal engine
+      engine_note_on(note, vel)
       clock.run(function()
         clock.sleep(state.gate)
+        -- MIDI off
         midi_note_off(note, 1)
+        -- Engine off
+        engine_note_off(note)
       end)
     end)
   end
@@ -204,10 +227,16 @@ local function play_fingerpick(chord_notes, pattern_idx)
       local delay = (i - 1) * 0.1
       clock.run(function()
         clock.sleep(delay)
+        -- MIDI output
         midi_note_on(chord_notes[step], 80, 1)
+        -- Internal engine
+        engine_note_on(chord_notes[step], 80)
         clock.run(function()
           clock.sleep(state.gate)
+          -- MIDI off
           midi_note_off(chord_notes[step], 1)
+          -- Engine off
+          engine_note_off(chord_notes[step])
         end)
       end)
     end
@@ -425,6 +454,7 @@ end
 -- INIT
 ------------------------------------------------------------
 function init()
+  engine.name = "MollyThePoly"
   reconnect_midi()
   params:add_option("out_b", "Dual MIDI out", {"off", "on"}, 1)
   params:set_action("out_b", function(v)
@@ -455,5 +485,6 @@ function init()
 end
 
 function cleanup()
+  engine.noteOffAll()
   clock.cancel_all()
 end
