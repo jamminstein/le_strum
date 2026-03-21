@@ -378,12 +378,10 @@ function redraw()
     screen.level(0)
     screen.font_size(8)
     screen.move(65, 32)
-    screen.text_align_center()
     screen.text(state.popup_param)
     
     screen.move(65, 42)
     screen.text(tostring(state.popup_val))
-    screen.text_align_left()
     
     state.popup_time = state.popup_time - 1
   end
