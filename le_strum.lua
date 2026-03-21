@@ -1,4 +1,4 @@
--- le_strum.lua ENHANCED
+-- le_strum.lua ENHANCED with OP-XY MIDI
 -- Le Grand Strum-inspired strummed chord controller for norns + grid (v6)
 -- Features: scale mode, organ buttons, guitar bass, chord hold,
 --           retrigger on chord change, clock-synced arpeggiator
@@ -8,6 +8,7 @@
 -- - Fingerpick patterns: named patterns (travis, arpeggio, waltz, folk)
 -- - NEW SCREEN DESIGN: Status strip, live zone with string decay animation, context bar, parameter popup
 -- - Internal Engine: MollyThePoly for polyphonic sound output
+-- - OP-XY MIDI support with strum speed mapped to CC 20 (attack)
 
 -- midi and grid are norns globals, no require needed
 
@@ -53,6 +54,26 @@ local function midi_to_hz(note)
 end
 
 ------------------------------------------------------------
+-- OP-XY MIDI helpers
+------------------------------------------------------------
+local opxy_out = nil
+local function opxy_note_on(note, vel)
+  if opxy_out and params:get("opxy_enabled") == 2 then
+    opxy_out:note_on(note, vel, params:get("opxy_channel"))
+  end
+end
+local function opxy_note_off(note)
+  if opxy_out and params:get("opxy_enabled") == 2 then
+    opxy_out:note_off(note, 0, params:get("opxy_channel"))
+  end
+end
+local function opxy_cc(cc, val)
+  if opxy_out and params:get("opxy_enabled") == 2 then
+    opxy_out:cc(cc, math.floor(util.clamp(val, 0, 127)), params:get("opxy_channel"))
+  end
+end
+
+------------------------------------------------------------
 -- MIDI outputs (dual)
 ------------------------------------------------------------
 local out_a_port = 1
@@ -65,16 +86,19 @@ local mB = nil
 local function reconnect_midi()
   mA = midi.connect(out_a_port)
   mB = midi.connect(out_b_port)
+  opxy_out = midi.connect(params:get("opxy_device"))
 end
 
 local function midi_note_on(note, vel, ch)
   mA:note_on(note, vel, ch)
   if out_b_enabled then mB:note_on(note, vel, ch) end
+  opxy_note_on(note, vel)
 end
 
 local function midi_note_off(note, ch)
   mA:note_off(note, ch)
   if out_b_enabled then mB:note_off(note, ch) end
+  opxy_note_off(note)
 end
 
 ------------------------------------------------------------
@@ -206,6 +230,10 @@ local function play_chord(chord_notes, vel)
     end)
   end
   
+  -- Map strum speed to CC 20 (attack): faster strum = shorter attack
+  local attack_cc = math.floor((1.0 - state.strum_speed) * 127)
+  opxy_cc(20, attack_cc)
+  
   -- Trigger string flash animation (ensure enough elements)
   for i = 1, math.max(6, #chord_notes) do
     state.string_flash[i] = state.string_flash[i] or 0
@@ -274,6 +302,15 @@ function redraw()
     screen.text("CAP"..state.capo)
   end
   
+  -- OP-XY status
+  screen.level(5)
+  screen.move(2, 62)
+  if params:get("opxy_enabled") == 2 then
+    screen.text("OP-XY: CH" .. params:get("opxy_channel"))
+  else
+    screen.text("OP-XY: OFF")
+  end
+  
   -- Beat pulse
   local beat_flash = (state.beat_phase % 4) < 2 and 12 or 4
   screen.level(beat_flash)
@@ -317,19 +354,19 @@ function redraw()
   -- CONTEXT BAR (y 53-58)
   screen.level(6)
   screen.font_size(7)
-  screen.move(2, 63)
+  screen.move(2, 52)
   screen.text("KEY:"..state.key)
   
   screen.level(5)
-  screen.move(30, 63)
+  screen.move(30, 52)
   screen.text(state.scale_name:sub(1,4))
   
   screen.level(5)
-  screen.move(60, 63)
+  screen.move(60, 52)
   screen.text("CHD:"..state.chord_type)
   
   screen.level(4)
-  screen.move(100, 63)
+  screen.move(100, 52)
   screen.text("SPD:"..string.format("%.1f", state.strum_speed))
   
   -- POPUP
@@ -455,13 +492,20 @@ end
 ------------------------------------------------------------
 function init()
   engine.name = "MollyThePoly"
-  reconnect_midi()
+  
+  params:add_separator("OP-XY")
+  params:add_option("opxy_enabled", "OP-XY output", {"off", "on"}, 1)
+  params:add_number("opxy_device", "OP-XY MIDI device", 1, 4, 1)
+  params:add_number("opxy_channel", "OP-XY channel", 1, 8, 1)
+  params:set_action("opxy_device", function(v) opxy_out = midi.connect(v) end)
+  
   params:add_option("out_b", "Dual MIDI out", {"off", "on"}, 1)
   params:set_action("out_b", function(v)
     out_b_enabled = (v == 2)
     reconnect_midi()
   end)
   
+  reconnect_midi()
   params:bang()
   redraw()
   grid_redraw()
@@ -486,5 +530,8 @@ end
 
 function cleanup()
   engine.noteOffAll()
+  if opxy_out and params:get("opxy_enabled") == 2 then
+    opxy_out:all_notes_off(params:get("opxy_channel"))
+  end
   clock.cancel_all()
 end
