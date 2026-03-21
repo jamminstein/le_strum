@@ -527,7 +527,7 @@ function init()
 end
 
 function cleanup()
-  engine.noteOffAll()
+  engine.noteKillAll()
   if opxy_out and params:get("opxy_enabled") == 2 then
     opxy_out:all_notes_off(params:get("opxy_channel"))
   end
