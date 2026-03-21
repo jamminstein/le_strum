@@ -4,6 +4,7 @@
 --           retrigger on chord change, clock-synced arpeggiator
 --
 engine.name = "MollyThePoly"
+local MollyThePoly = require "molly_the_poly/lib/molly_the_poly_engine"
 -- NEW FEATURES:
 -- - Velocity-sensitive strum: measure time between column presses, map to velocity
 -- - Fingerpick patterns: named patterns (travis, arpeggio, waltz, folk)
@@ -491,7 +492,17 @@ end
 -- INIT
 ------------------------------------------------------------
 function init()
-  
+  -- MollyThePoly sound params
+  MollyThePoly.add_params()
+  -- Guitar-like preset (brighter, shorter release)
+  params:set("osc_wave_shape", 0.4)
+  params:set("lp_filter_cutoff", 3000)
+  params:set("lp_filter_resonance", 0.2)
+  params:set("env_2_attack", 0.005)
+  params:set("env_2_decay", 0.6)
+  params:set("env_2_sustain", 0.4)
+  params:set("env_2_release", 0.6)
+
   params:add_separator("OP-XY")
   params:add_option("opxy_enabled", "OP-XY output", {"off", "on"}, 1)
   params:add_number("opxy_device", "OP-XY MIDI device", 1, 4, 1)
