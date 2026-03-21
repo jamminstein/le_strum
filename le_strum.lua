@@ -183,8 +183,9 @@ local function play_chord(chord_notes, vel)
     end)
   end
   
-  -- Trigger string flash animation
-  for i = 1, 6 do
+  -- Trigger string flash animation (ensure enough elements)
+  for i = 1, math.max(6, #chord_notes) do
+    state.string_flash[i] = state.string_flash[i] or 0
     state.string_flash[i] = 12
   end
 end
@@ -233,10 +234,9 @@ function redraw()
   
   -- Current key at center
   screen.level(12)
-  screen.move(64, 8)
-  screen.text_align_center()
+  local w, h = screen.text_extents(state.key)
+  screen.move(64 - w/2, 8)
   screen.text(state.key)
-  screen.text_align_left()
   
   -- Capo indicator
   if state.capo > 0 then
@@ -269,7 +269,7 @@ function redraw()
   for i = 1, math.min(6, #chord_notes) do
     local x = 30 + (i - 1) * 15
     local y = y_base + (i - 1) * y_spacing
-    local brightness = clamp(state.string_flash[i], 3, 12)
+    local brightness = clamp(state.string_flash[i] or 3, 3, 12)
     screen.level(brightness)
     screen.circle(x, y, 2)
     screen.fill()
@@ -442,7 +442,8 @@ function init()
       state.beat_phase = (state.beat_phase + 1) % 360
       
       -- Decay string flash
-      for i = 1, 6 do
+      for i = 1, math.max(6, #state.string_flash) do
+        state.string_flash[i] = state.string_flash[i] or 0
         state.string_flash[i] = math.max(3, state.string_flash[i] - 1.5)
       end
       
