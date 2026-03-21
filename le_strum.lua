@@ -97,8 +97,8 @@ local function midi_note_on(note, vel, ch)
 end
 
 local function midi_note_off(note, ch)
-  mA:note_off(note, ch)
-  if out_b_enabled then mB:note_off(note, ch) end
+  mA:note_off(note, 0, ch)
+  if out_b_enabled then mB:note_off(note, 0, ch) end
   opxy_note_off(note)
 end
 
