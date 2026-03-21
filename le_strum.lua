@@ -59,6 +59,7 @@ end
 -- OP-XY MIDI helpers
 ------------------------------------------------------------
 local opxy_out = nil
+local screen_clock_id = nil
 local function opxy_note_on(note, vel)
   if opxy_out and params:get("opxy_enabled") == 2 then
     opxy_out:note_on(note, vel, params:get("opxy_channel"))
@@ -521,7 +522,7 @@ function init()
   grid_redraw()
   
   -- Animation loop
-  clock.run(function()
+  screen_clock_id = clock.run(function()
     while true do
       state.beat_phase = (state.beat_phase + 1) % 360
       
@@ -539,9 +540,9 @@ function init()
 end
 
 function cleanup()
+  if screen_clock_id then clock.cancel(screen_clock_id) end
   engine.noteKillAll()
-  if opxy_out and params:get("opxy_enabled") == 2 then
-    for ch=1,16 do opxy_out:cc(123, 0, ch) end
-  end
-  clock.cancel_all()
+  if mA then for ch=1,16 do mA:cc(123,0,ch) end end
+  if mB then for ch=1,16 do mB:cc(123,0,ch) end end
+  if opxy_out then for ch=1,16 do opxy_out:cc(123,0,ch) end end
 end
