@@ -279,99 +279,85 @@ end
 ------------------------------------------------------------
 function redraw()
   screen.clear()
-  screen.aa(1)
-  
-  -- STATUS STRIP (y 0-10)
-  screen.level(4)
-  screen.rect(0, 0, 128, 11)
-  screen.fill()
-  
+  screen.aa(0)
+  screen.font_face(1)
+  screen.font_size(8)
+
+  -- HEADER
   screen.level(15)
-  screen.font_face(7)
-  screen.font_size(8)
-  screen.move(2, 8)
+  screen.move(2, 7)
   screen.text("LE STRUM")
-  
-  -- Current key at center
-  screen.level(12)
-  local w = screen.text_extents and screen.text_extents(state.key) or (#state.key * 6)
-  local h = 8
-  screen.move(64 - w/2, 8)
+
+  screen.level(10)
+  screen.move(64, 7)
   screen.text(state.key)
-  
-  -- Capo indicator
+
   if state.capo > 0 then
-    screen.level(8)
-    screen.move(100, 8)
-    screen.text("CAP"..state.capo)
+    screen.level(6)
+    screen.move(100, 7)
+    screen.text("C+" .. state.capo)
   end
-  
-  -- OP-XY status
-  screen.level(5)
-  screen.move(2, 62)
-  if params:get("opxy_enabled") == 2 then
-    screen.text("OP-XY: CH" .. params:get("opxy_channel"))
-  else
-    screen.text("OP-XY: OFF")
-  end
-  
-  -- Beat pulse
-  local beat_flash = (state.beat_phase % 4) < 2 and 12 or 4
-  screen.level(beat_flash)
-  screen.circle(120, 5, 2)
+
+  -- Beat dot
+  local beat_on = (state.beat_phase % 4) < 2
+  screen.level(beat_on and 15 or 2)
+  screen.pixel(124, 3)
   screen.fill()
-  
-  -- LIVE ZONE (y 12-52)
+
+  -- Divider
+  screen.level(2)
+  screen.move(0, 10)
+  screen.line(128, 10)
+  screen.stroke()
+
+  -- STRINGS (y 14-44)
   local chord_notes = get_chord(state.root_note + state.capo, state.chord_type)
-  local y_base = 15
-  local y_spacing = 6
-  
-  -- Draw 6 string lines
+  local y_base = 16
+  local y_spacing = 5
+
   for i = 1, 6 do
-    screen.level(3)
     local y = y_base + (i - 1) * y_spacing
-    screen.move(10, y)
-    screen.line(120, y)
+    -- String line
+    screen.level(2)
+    screen.move(8, y)
+    screen.line(118, y)
     screen.stroke()
+    -- Fret dot
+    if i <= #chord_notes then
+      local brightness = clamp(state.string_flash[i] or 4, 4, 15)
+      screen.level(brightness)
+      screen.rect(28 + (i - 1) * 14, y - 2, 5, 5)
+      screen.fill()
+      -- Note name
+      local note_name = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"}
+      screen.level(6)
+      screen.move(28 + (i - 1) * 14, y + 9)
+      screen.text(note_name[(chord_notes[i] % 12) + 1])
+    end
   end
-  
-  -- Draw chord note dots with flash animation
-  for i = 1, math.min(6, #chord_notes) do
-    local x = 30 + (i - 1) * 15
-    local y = y_base + (i - 1) * y_spacing
-    local brightness = clamp(state.string_flash[i] or 3, 3, 12)
-    screen.level(brightness)
-    screen.circle(x, y, 2)
-    screen.fill()
-  end
-  
-  -- Strum direction indicator
+
+  -- Strum direction
+  screen.level(state.strum_dir_locked and 15 or 6)
+  screen.move(122, 30)
+  screen.text(state.strum_dir == 1 and "v" or "^")
+
+  -- BOTTOM INFO (y 52-63)
+  screen.level(2)
+  screen.move(0, 53)
+  screen.line(128, 53)
+  screen.stroke()
+
   screen.level(8)
-  screen.font_size(8)
-  local arrow = state.strum_dir == 1 and "v" or "^"
-  if state.strum_dir_locked then
-    screen.level(15)
-  end
-  screen.move(115, 35)
-  screen.text(arrow)
-  
-  -- CONTEXT BAR (y 53-58)
+  screen.move(2, 61)
+  screen.text(state.scale_name:sub(1, 6))
+
   screen.level(6)
-  screen.font_size(7)
-  screen.move(2, 52)
-  screen.text("KEY:"..state.key)
-  
-  screen.level(5)
-  screen.move(30, 52)
-  screen.text(state.scale_name:sub(1,4))
-  
-  screen.level(5)
-  screen.move(60, 52)
-  screen.text("CHD:"..state.chord_type)
-  
+  screen.move(50, 61)
+  screen.text(state.chord_type)
+
   screen.level(4)
-  screen.move(100, 52)
-  screen.text("SPD:"..string.format("%.1f", state.strum_speed))
+  screen.move(80, 61)
+  screen.text("SPD:" .. string.format("%.0f", state.strum_speed))
   
   -- POPUP
   if state.popup_param and state.popup_time > 0 then
