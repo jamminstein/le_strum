@@ -294,7 +294,8 @@ function redraw()
   
   -- Current key at center
   screen.level(12)
-  local w, h = screen.text_extents(state.key)
+  local w = screen.text_extents and screen.text_extents(state.key) or (#state.key * 6)
+  local h = 8
   screen.move(64 - w/2, 8)
   screen.text(state.key)
   
